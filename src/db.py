@@ -20,11 +20,31 @@ from src.normalize import (
 DEFAULT_DB_PATH = Path(os.environ.get("AZ_BIDTABS_DB", "data/az_bidtabs.db"))
 
 
+def _read_dotenv_var(key: str) -> str | None:
+    for fname in (".env.local", ".env"):
+        env_path = Path(__file__).resolve().parent.parent / fname
+        if env_path.is_file():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+    return None
+
+
 def get_database_url() -> str | None:
-    """Return Postgres DATABASE_URL from env var or Streamlit secrets if configured."""
+    """Return Postgres DATABASE_URL from env var, .env.local, or Streamlit secrets."""
     env_url = os.environ.get("DATABASE_URL", "").strip()
     if env_url:
         return env_url
+    dotenv_url = _read_dotenv_var("DATABASE_URL")
+    if dotenv_url:
+        return dotenv_url
     try:
         import streamlit as st
 

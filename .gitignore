@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 data/*.db
 .DS_Store
+.env
+.env.*
+.neon
+node_modules/
