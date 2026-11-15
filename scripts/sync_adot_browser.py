@@ -164,10 +164,16 @@ def sync_adot_via_browser(
             try:
                 frame_anchors = frame.eval_on_selector_all(
                     "a[href]",
-                    """els => els.map(e => ({
-                        href: e.getAttribute('href') || '',
-                        text: (e.innerText || e.textContent || '').trim()
-                    }))""",
+                    """els => els.map(e => {
+                        const row = e.closest('tr');
+                        const rowText = row ? (row.innerText || row.textContent || '') : '';
+                        return {
+                            href: e.getAttribute('href') || '',
+                            text: (e.innerText || e.textContent || '').trim(),
+                            rowText: rowText.replace(/\\s+/g, ' ').trim(),
+                            titleAttr: e.getAttribute('title') || e.getAttribute('aria-label') || ''
+                        };
+                    })""",
                 )
                 for a in frame_anchors:
                     a["base_url"] = frame.url or url
@@ -179,18 +185,31 @@ def sync_adot_via_browser(
         seen: set[str] = set()
         for a in anchors:
             href = a["href"].strip()
-            if ".pdf" not in href.lower():
-                continue
             full_url = urljoin(a.get("base_url") or url, href)
+            href_lower = full_url.lower()
+            is_s3_adot_doc = "azdotcloud-prod-s3-files/document/" in href_lower
+            is_pdf_href = ".pdf" in href_lower
+            if not (is_s3_adot_doc or is_pdf_href):
+                continue
             if full_url in seen:
                 continue
             seen.add(full_url)
-            title = a["text"] or Path(href.split("?")[0]).stem
-            combined = f"{title} {href}".lower()
-            if "bid" not in combined and "tab" not in combined and not extract_tracs_from_text(combined):
+
+            row_ctx = " ".join(
+                p for p in (a.get("text", ""), a.get("titleAttr", ""), a.get("rowText", "")) if p
+            ).strip()
+            combined = f"{row_ctx} {href}".lower()
+            if not is_s3_adot_doc and (
+                "bid" not in combined and "tab" not in combined and not extract_tracs_from_text(combined)
+            ):
                 continue
-            tracs = extract_tracs_from_text(f"{title} {href}") or Path(href.split("?")[0]).stem[:24]
-            pdf_links.append({"url": full_url, "title": title, "project_num": tracs})
+
+            tracs = (
+                extract_tracs_from_text(f"{row_ctx} {href}")
+                or Path(href.split("?")[0]).stem[:24]
+            )
+            title = a.get("rowText") or a.get("text") or Path(href.split("?")[0]).stem
+            pdf_links.append({"url": full_url, "title": title[:160], "project_num": tracs})
             if len(pdf_links) >= limit:
                 break
 
@@ -198,12 +217,23 @@ def sync_adot_via_browser(
         print(f"Discovered {discovered} ADOT Bid Tab PDF links (scanned {len(anchors)} total anchors).")
         if discovered == 0:
             print(f"Frame URLs: {frame_urls}")
-            interesting = [
-                (a["text"][:60], a["href"][:120])
-                for a in anchors
-                if any(k in (a["text"] + a["href"]).lower() for k in ("bid", "tab", "pdf", "doc", "tracs", "2025", "2026", "result", "historical"))
-            ]
-            print(f"Sample matching anchors ({len(interesting)}): {interesting[:30]}")
+        elif dry_run and pdf_links:
+            sample_item = pdf_links[0]
+            print(f"Sample discovered link[0]: project_num={sample_item['project_num']!r} title={sample_item['title']!r} url={sample_item['url']}")
+            try:
+                s_resp = context.request.get(sample_item["url"], timeout=60000)
+                s_bytes = s_resp.body() if s_resp.ok else b""
+                is_pdf = s_bytes.lstrip().startswith(b"%PDF")
+                print(f"Sample PDF fetch: HTTP {s_resp.status} | bytes={len(s_bytes)} | is_pdf={is_pdf}")
+                if is_pdf:
+                    s_parsed = parse_adot_bid_tab_pdf(s_bytes, filename=f"{sample_item['project_num']}.pdf")
+                    print(
+                        f"Sample PDF parsed: proj={s_parsed.agency_project_num!r} "
+                        f"date={s_parsed.letting_date!r} contractor={s_parsed.awarded_contractor!r} "
+                        f"lines={len(s_parsed.lines)}"
+                    )
+            except Exception as exc:
+                print(f"Sample PDF dry-run check error: {exc}")
 
         for item in pdf_links:
             proj_num = item["project_num"]
