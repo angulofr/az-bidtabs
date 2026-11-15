@@ -111,4 +111,58 @@ def test_adot_e2c2_csv_ingest(tmp_path: Path):
     assert get_overview_stats(db_path)["projects"] == 2
 
 
+def test_adot_bid_results_pdf_format(tmp_path: Path):
+    from src.scrapers.adot import ParsedProjectBidTab, _parse_adot_bid_results_format, ingest_parsed_project
+
+    lines = [
+        "Printed: 9/22/2026 Page 1 of 15",
+        "BID RESULTS FOR 2026005",
+        "Bid Opening Date : 8/21/2026, Prequalification Required, Engineer Specialist : Rene Teran",
+        "The proposed project is located in Cochise County beginning at MP 377.0 (San Simon) and extends east along Interstate 10 to MP 391.23 (New Mexico State Line). The construction is being administered by the ADOT Southeast District.",
+        "+% $47,458,932.00 DEPARTMENT ESTIMATE $47,458,932.00",
+        "1 -22.2% $36,933,626.20 FNF CONSTRUCTION, INC. $36,933,626.20",
+        "2 -17.3% $39,255,777.77 FANN CONTRACTING, INC $39,255,777.77",
+        "*** Bid Tabs for Proposal Pamphlet 2026005 ***",
+        "Item Number Unit of Measure Item Description Quantity Unit Price Extended Amount Compared To Dept Estimate",
+        "2020009 CU.YD. REMOVAL OF STRUCTURAL CONCRETE",
+        "Bid Rank Department Estimate 1.000 $500.000 $500.00",
+        "1 FNF CONSTRUCTION, INC. $30,000.000 $30,000.00 +5900.0%",
+        "2 FANN CONTRACTING, INC $3,500.000 $3,500.00 +600.0%",
+        "2020081 SQ.YD. REMOVE BITUMINOUS PAVEMENT (MILLING) (1\")",
+        "Bid Rank Department Estimate 256,100.000 $2.000 $512,200.00",
+        "1 FNF CONSTRUCTION, INC. $1.100 $281,710.00 -45.0%",
+        "2 FANN CONTRACTING, INC $1.750 $448,175.00 -12.5%",
+    ]
+
+    parsed = ParsedProjectBidTab(
+        agency="ADOT",
+        agency_project_num="F069101C",
+        title="Interstate 10 — Cochise County (2026005)",
+        county="Cochise",
+        district="Southeast",
+        letting_date="2026-08-21",
+    )
+    ok = _parse_adot_bid_results_format(lines, parsed)
+    assert ok is True
+    assert parsed.engineers_estimate == 47458932.00
+    assert parsed.winning_bid_total == 36933626.20
+    assert parsed.awarded_contractor == "FNF CONSTRUCTION, INC."
+    assert len(parsed.lines) == 6
+    assert parsed.lines[1].bidder_name == "FNF CONSTRUCTION, INC."
+    assert parsed.lines[1].is_winner is True
+    assert parsed.lines[4].quantity == 256100.0
+    assert parsed.lines[4].unit_price == 1.10
+
+    db_path = tmp_path / "adot_pdf.db"
+    init_db(db_path)
+    ingest_parsed_project(parsed, db_path)
+    # Re-ingest should remain idempotent
+    ingest_parsed_project(parsed, db_path)
+    ov = get_overview_stats(db_path)
+    assert ov["projects"] == 1
+    assert ov["bid_lines"] == 6
+    assert ov["contractors"] == 2
+
+
+
 

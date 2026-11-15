@@ -654,7 +654,7 @@ elif page == "Ingestion & Scrapers":
                             }
                         )
                     elif ext == ".pdf":
-                        parsed_item = adot_scraper.parse_adot_bid_tab_pdf(raw_bytes)
+                        parsed_item = adot_scraper.parse_adot_bid_tab_pdf(raw_bytes, filename=f.name)
                         if parsed_item.agency_project_num == "ADOT-UNKNOWN":
                             parsed_item.agency_project_num = Path(f.name).stem[:32]
                         parsed_batch.append((f.name, parsed_item, None))
@@ -739,7 +739,7 @@ elif page == "Ingestion & Scrapers":
         st.markdown("Upload an official ADOT Bid Tabulation PDF (`azdot.gov`) to parse and ingest.")
         pdf_file = st.file_uploader("ADOT Bid Tab PDF", type=["pdf"])
         if pdf_file is not None:
-            parsed = adot_scraper.parse_adot_bid_tab_pdf(pdf_file.read())
+            parsed = adot_scraper.parse_adot_bid_tab_pdf(pdf_file.read(), filename=pdf_file.name)
             st.write(
                 f"**Project:** `{parsed.agency_project_num}` — {parsed.title} | "
                 f"**County:** {parsed.county or '—'} | **Parsed Lines:** {len(parsed.lines)}"

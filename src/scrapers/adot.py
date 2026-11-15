@@ -70,14 +70,161 @@ def _to_float(val: str) -> float:
     return float(cleaned) if cleaned else 0.0
 
 
-def parse_adot_bid_tab_pdf(pdf_source: bytes | str | Path) -> ParsedProjectBidTab:
+def _parse_adot_bid_results_format(
+    all_text_lines: list[str],
+    parsed: ParsedProjectBidTab,
+) -> bool:
+    """Parse ADOT 'BID RESULTS FOR <pamphlet>' / '*** Bid Tabs for Proposal Pamphlet ***' PDFs."""
+    has_bid_tabs = any(
+        "BID TABS FOR PROPOSAL PAMPHLET" in ln.upper() or "DEPARTMENT ESTIMATE" in ln.upper()
+        for ln in all_text_lines
+    )
+    if not has_bid_tabs:
+        return False
+
+    # Page 1 summary totals
+    for line in all_text_lines:
+        clean = re.sub(r"\s+", " ", line).strip()
+        if "DEPARTMENT ESTIMATE" in clean.upper() and "$" in clean and not parsed.engineers_estimate:
+            m_ee = re.search(r"\$([\d,]+\.\d{2})\s+DEPARTMENT\s+ESTIMATE", clean, re.IGNORECASE)
+            if m_ee:
+                parsed.engineers_estimate = _to_float(m_ee.group(1))
+        m_p1_rank = re.match(
+            r"^1\s+[+\-]?\d+(?:\.\d+)?%\s+\$([\d,]+\.\d{2})\s+(.+?)(?:\s+\$[\d,]+\.\d{2})?$",
+            clean,
+        )
+        if m_p1_rank and not parsed.awarded_contractor:
+            parsed.winning_bid_total = _to_float(m_p1_rank.group(1))
+            parsed.awarded_contractor = m_p1_rank.group(2).strip()
+
+    # Item & bid tab lines (Page 2+)
+    item_hdr_re = re.compile(r"^(\d{6,7}[A-Z]?)\s+([A-Z][A-Z0-9\.]{1,12})\s+(.+)$")
+    dept_est_re = re.compile(
+        r"^(?:Bid\s*Rank\s+)?Department\s+Estimate\s+([\d,]+(?:\.\d+)?)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)",
+        re.IGNORECASE,
+    )
+    bidder_re = re.compile(
+        r"^(\d{1,2})\s+([A-Z0-9].+?)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)(?:\s+(?:[+\-]?[\d,]+(?:\.\d+)?%|N/?A))?$"
+    )
+    skip_prefixes = (
+        "PRINTED:",
+        "PAGE ",
+        "***",
+        "ITEM",
+        "NUMBER",
+        "MEASURE",
+        "BID RANK",
+        "UNIT OF",
+        "COMPARED TO",
+        "WINNING BIDDER",
+    )
+
+    current_code = ""
+    current_unit = ""
+    current_desc = ""
+    current_qty = 0.0
+    awaiting_dept_est = False
+
+    for line in all_text_lines:
+        clean = re.sub(r"\s+", " ", line).strip()
+        upper = clean.upper()
+
+        if any(upper.startswith(p) for p in skip_prefixes):
+            # Note: "Bid Rank Department Estimate ..." starts with "BID RANK", so check dept_est_re first!
+            if not dept_est_re.match(clean):
+                continue
+
+        m_est = dept_est_re.match(clean)
+        if m_est and current_code:
+            awaiting_dept_est = False
+            qty = _to_float(m_est.group(1))
+            up = _to_float(m_est.group(2))
+            ext = _to_float(m_est.group(3))
+            current_qty = qty
+            parsed.lines.append(
+                ParsedBidLine(
+                    item_code=current_code,
+                    description=current_desc,
+                    unit=current_unit,
+                    quantity=qty,
+                    unit_price=up,
+                    extended_total=ext,
+                    bidder_name="DEPARTMENT ESTIMATE",
+                    is_engineers_estimate=True,
+                    bid_rank=None,
+                    is_winner=False,
+                )
+            )
+            continue
+
+        m_item = item_hdr_re.match(clean)
+        if m_item and "$" not in clean:
+            current_code = normalize_item_code(m_item.group(1))
+            current_unit = normalize_unit(m_item.group(2))
+            current_desc = m_item.group(3).strip()
+            current_qty = 0.0
+            awaiting_dept_est = True
+            continue
+
+        m_bid = bidder_re.match(clean)
+        if m_bid and current_code and current_qty > 0:
+            awaiting_dept_est = False
+            rank = int(m_bid.group(1))
+            bidder_name = m_bid.group(2).strip()
+            up = _to_float(m_bid.group(3))
+            ext = _to_float(m_bid.group(4))
+            parsed.lines.append(
+                ParsedBidLine(
+                    item_code=current_code,
+                    description=current_desc,
+                    unit=current_unit,
+                    quantity=current_qty,
+                    unit_price=up,
+                    extended_total=ext,
+                    bidder_name=bidder_name,
+                    is_engineers_estimate=False,
+                    bid_rank=rank,
+                    is_winner=(rank == 1),
+                )
+            )
+            continue
+
+        # Handle wrapped description line right after an item header
+        if awaiting_dept_est and current_code and "$" not in clean:
+            current_desc = f"{current_desc} {clean}".strip()
+
+    # Fallback calculation for project totals if Page 1 didn't match
+    if parsed.lines:
+        if not parsed.engineers_estimate:
+            parsed.engineers_estimate = round(
+                sum(l.extended_total for l in parsed.lines if l.is_engineers_estimate), 2
+            )
+        if not parsed.winning_bid_total:
+            parsed.winning_bid_total = round(
+                sum(l.extended_total for l in parsed.lines if l.is_winner), 2
+            )
+        if not parsed.awarded_contractor:
+            w = next((l.bidder_name for l in parsed.lines if l.is_winner), "")
+            parsed.awarded_contractor = w
+
+    return len(parsed.lines) > 0
+
+
+def parse_adot_bid_tab_pdf(
+    pdf_source: bytes | str | Path,
+    *,
+    filename: str | None = None,
+) -> ParsedProjectBidTab:
     """Parse an ADOT official bid tabulation PDF using pdfplumber.
 
-    Supports both tabular bid-tab layouts and line-oriented ADOT Trns*Port/BAMS exports.
+    Supports ADOT 'BID RESULTS FOR <pamphlet>' / 'Bid Tabs for Proposal Pamphlet' PDFs
+    as well as tabular and Trns*Port/BAMS exports.
     """
     if isinstance(pdf_source, (str, Path)):
+        src_name = filename or Path(pdf_source).name
         pdf_ctx = pdfplumber.open(str(pdf_source))
     else:
+        src_name = filename or ""
         pdf_ctx = pdfplumber.open(io.BytesIO(pdf_source))
 
     all_text_lines: list[str] = []
@@ -92,29 +239,64 @@ def parse_adot_bid_tab_pdf(pdf_source: bytes | str | Path) -> ParsedProjectBidTa
 
     full_text = "\n".join(all_text_lines)
 
-    # Extract header metadata
-    proj_match = re.search(
-        r"(?:TRACS\s*(?:NO\.?|#)?|PROJECT\s*(?:NO\.?|#)?)\s*:?\s*([A-Z0-9\-]+)",
+    # Extract TRACS number (e.g. F069101C, H687001C) or Proposal Pamphlet ID (e.g. 2026005)
+    tracs_match = re.search(r"\b([FH]\d{3,5}[0-9A-Z]{2,4})\b", f"{src_name}\n{full_text}", re.IGNORECASE)
+    pamphlet_match = re.search(
+        r"(?:BID\s+RESULTS\s+FOR|PROPOSAL\s+PAMPHLET)\s+([A-Z0-9\-]+)",
         full_text,
         re.IGNORECASE,
     )
-    proj_num = proj_match.group(1) if proj_match else "ADOT-UNKNOWN"
+    proj_num_match = re.search(
+        r"(?:TRACS\s*(?:NO\.?|#)|PROJECT\s*(?:NO\.?|#))\s*:?\s*([A-Z0-9\-]+)",
+        full_text,
+        re.IGNORECASE,
+    )
+    if tracs_match:
+        proj_num = tracs_match.group(1).upper()
+    elif pamphlet_match:
+        proj_num = pamphlet_match.group(1).upper()
+    elif proj_num_match:
+        proj_num = proj_num_match.group(1).upper()
+    else:
+        proj_num = "ADOT-UNKNOWN"
 
     date_match = re.search(
-        r"(?:LETTING\s*DATE|BID\s*OPENING)\s*:?\s*(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})",
+        r"(?:LETTING\s*DATE|BID\s*OPENING(?:\s*DATE)?)\s*:?\s*(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})",
         full_text,
         re.IGNORECASE,
     )
-    letting_date = date_match.group(1) if date_match else ""
+    letting_date = _parse_e2c2_date(date_match.group(1)) if date_match else ""
 
-    county_match = re.search(r"COUNTY\s*:?\s*([A-Za-z\s]+?)(?:\n|DISTRICT|$)", full_text, re.IGNORECASE)
+    county_match = (
+        re.search(r"located\s+in\s+([A-Za-z\s]+?)\s+County", full_text, re.IGNORECASE)
+        or re.search(r"COUNTY\s*:?\s*([A-Za-z\s]+?)(?:\n|DISTRICT|$)", full_text, re.IGNORECASE)
+    )
     county = county_match.group(1).strip().title() if county_match else ""
 
-    route_match = re.search(r"(?:ROUTE|LOCATION)\s*:?\s*([^\n]+)", full_text, re.IGNORECASE)
+    dist_match = re.search(r"ADOT\s+([A-Za-z\s]+?)\s+District", full_text, re.IGNORECASE)
+    district = dist_match.group(1).strip().title() if dist_match else ""
+
+    route_match = (
+        re.search(r"along\s+([A-Za-z0-9\-\.\s]+?)\s+(?:to|beginning|MP|\.)", full_text, re.IGNORECASE)
+        or re.search(r"(?:ROUTE|LOCATION)\s*:?\s*([^\n]+)", full_text, re.IGNORECASE)
+    )
     route = route_match.group(1).strip() if route_match else ""
 
-    title_match = re.search(r"(?:PROJECT\s*NAME|DESCRIPTION|TITLE)\s*:?\s*([^\n]+)", full_text, re.IGNORECASE)
-    title = title_match.group(1).strip() if title_match else f"ADOT Project {proj_num}"
+    desc_para_match = re.search(
+        r"(The\s+proposed\s+project\s+is\s+located\s+in\s+[^\.]+(?:\.[^\.]+)?)",
+        re.sub(r"\s+", " ", full_text),
+        re.IGNORECASE,
+    )
+    title_match = re.search(r"(?:PROJECT\s*NAME|TITLE)\s*:?\s*([^\n]+)", full_text, re.IGNORECASE)
+    if title_match:
+        title = title_match.group(1).strip()
+    elif route and county:
+        pamphlet_tag = f" ({pamphlet_match.group(1)})" if pamphlet_match else ""
+        title = f"{route} — {county} County{pamphlet_tag}"
+    elif desc_para_match:
+        title = desc_para_match.group(1)[:120].strip()
+    else:
+        title = f"ADOT Project {proj_num}"
 
     parsed = ParsedProjectBidTab(
         agency="ADOT",
@@ -122,10 +304,15 @@ def parse_adot_bid_tab_pdf(pdf_source: bytes | str | Path) -> ParsedProjectBidTa
         title=title,
         route_or_location=route,
         county=county,
+        district=district,
         letting_date=letting_date,
         source_url=ADOT_BID_TABS_URL,
         spec_system="ADOT",
     )
+
+    # Strategy 0: Official ADOT "BID RESULTS FOR <pamphlet>" / "Bid Tabs for Proposal Pamphlet"
+    if _parse_adot_bid_results_format(all_text_lines, parsed):
+        return parsed
 
     # Strategy 1: Parse structured tables if present
     for table in extracted_tables:
@@ -133,12 +320,10 @@ def parse_adot_bid_tab_pdf(pdf_source: bytes | str | Path) -> ParsedProjectBidTa
             continue
         header = [str(c or "").strip().upper() for c in table[0]]
         if any("ITEM" in h for h in header) and any("UNIT" in h for h in header):
-            # Identify column indices
             idx_code = next((i for i, h in enumerate(header) if "ITEM" in h or "CODE" in h), 0)
             idx_desc = next((i for i, h in enumerate(header) if "DESC" in h), 1)
             idx_unit = next((i for i, h in enumerate(header) if "UNIT" in h and "PRICE" not in h), 2)
             idx_qty = next((i for i, h in enumerate(header) if "QTY" in h or "QUANT" in h), 3)
-            # Remaining columns after qty are often pairs of (Unit Price, Extended) or bidder columns
             for row in table[1:]:
                 if not row or len(row) <= max(idx_code, idx_desc, idx_unit, idx_qty):
                     continue
@@ -151,7 +336,6 @@ def parse_adot_bid_tab_pdf(pdf_source: bytes | str | Path) -> ParsedProjectBidTa
                     qty = _to_float(str(row[idx_qty] or "0"))
                 except ValueError:
                     continue
-                # Look for unit price + extended in remaining columns
                 rem = [str(c or "").strip() for c in row[idx_qty + 1 :] if str(c or "").strip()]
                 if len(rem) >= 2:
                     try:
@@ -270,7 +454,7 @@ def ingest_parsed_project(
     parsed: ParsedProjectBidTab,
     db_path: Path | str | None = None,
 ) -> int:
-    """Persist a ParsedProjectBidTab into SQLite or Postgres."""
+    """Persist a ParsedProjectBidTab into SQLite or Postgres (idempotent on re-upload)."""
     with db_session(db_path) as conn:
         awarded_cid = (
             upsert_contractor(conn, parsed.awarded_contractor)
@@ -292,30 +476,56 @@ def ingest_parsed_project(
             awarded_contractor_id=awarded_cid,
             source_url=parsed.source_url,
         )
+
+        # Idempotent re-import: clear prior lines for this project
+        conn.execute("DELETE FROM bid_lines WHERE project_id = ?", (project_id,))
+
+        contractor_cache: dict[str, int] = {}
+        item_cache: dict[tuple[str, str], int] = {}
+        rows: list[tuple[Any, ...]] = []
+
         for line in parsed.lines:
-            cid = (
-                None
-                if line.is_engineers_estimate
-                else upsert_contractor(conn, line.bidder_name)
+            if line.is_engineers_estimate:
+                cid = None
+            else:
+                if line.bidder_name not in contractor_cache:
+                    contractor_cache[line.bidder_name] = upsert_contractor(conn, line.bidder_name)
+                cid = contractor_cache[line.bidder_name]
+
+            item_key = (normalize_item_code(line.item_code), normalize_unit(line.unit))
+            if item_key not in item_cache:
+                item_cache[item_key] = upsert_pay_item(
+                    conn,
+                    spec_system=parsed.spec_system,
+                    item_code=line.item_code,
+                    description=line.description,
+                    unit=line.unit,
+                )
+            item_id = item_cache[item_key]
+
+            rows.append(
+                (
+                    project_id,
+                    cid,
+                    1 if line.is_engineers_estimate else 0,
+                    item_id,
+                    float(line.quantity),
+                    float(line.unit_price),
+                    float(line.extended_total),
+                    line.bid_rank,
+                    1 if line.is_winner else 0,
+                )
             )
-            item_id = upsert_pay_item(
-                conn,
-                spec_system=parsed.spec_system,
-                item_code=line.item_code,
-                description=line.description,
-                unit=line.unit,
-            )
-            insert_bid_line(
-                conn,
-                project_id=project_id,
-                contractor_id=cid,
-                is_engineers_estimate=line.is_engineers_estimate,
-                item_id=item_id,
-                quantity=line.quantity,
-                unit_price=line.unit_price,
-                extended_total=line.extended_total,
-                bid_rank=line.bid_rank,
-                is_winner=line.is_winner,
+
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO bid_lines (
+                    project_id, contractor_id, is_engineers_estimate, item_id,
+                    quantity, unit_price, extended_total, bid_rank, is_winner
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
             )
         return project_id
 
