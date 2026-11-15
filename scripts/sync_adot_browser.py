@@ -300,6 +300,7 @@ def sync_adot_via_browser(
                     print(f"Sample[{idx}] dry-run check error: {exc}")
 
         if probe_urls:
+            import base64 as _b64
             import io as _io
             from urllib.parse import urljoin as _uj
             import pdfplumber as _pp
@@ -307,7 +308,7 @@ def sync_adot_via_browser(
             for p_url in probe_urls:
                 try:
                     p_resp = page.goto(p_url, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(4000)
+                    page.wait_for_timeout(4500)
                     p_status = p_resp.status if p_resp else None
                     p_title = page.title()
                     summary = page.evaluate(
@@ -316,27 +317,27 @@ def sync_adot_via_browser(
                                 href: e.getAttribute('href') || '',
                                 text: (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim()
                             }));
-                            const docLinks = anchors.filter(a => {
-                                const h = a.href.toLowerCase();
-                                const t = a.text.toLowerCase();
-                                return h.includes('.pdf') || h.includes('.xlsx') || h.includes('.csv')
-                                    || t.includes('bid result') || t.includes('tabulation')
-                                    || t.includes('solicitation') || t.includes('bonfire')
-                                    || h.includes('bonfirehub') || h.includes('solicitations/details');
-                            });
-                            const rows = Array.from(document.querySelectorAll('table tr')).slice(0, 12).map(tr => ({
+                            const rows = Array.from(document.querySelectorAll('table tr')).slice(0, 10).map(tr => ({
                                 text: (tr.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 180),
                                 links: Array.from(tr.querySelectorAll('a[href]')).map(a => ({
-                                    text: (a.innerText || '').trim().slice(0, 50),
+                                    text: (a.innerText || '').trim().slice(0, 60),
                                     href: a.getAttribute('href') || ''
                                 }))
+                            }));
+                            const inputs = Array.from(document.querySelectorAll('input, select, button')).slice(0, 20).map(el => ({
+                                tag: el.tagName,
+                                id: el.id || '',
+                                name: el.getAttribute('name') || '',
+                                type: el.getAttribute('type') || '',
+                                value: (el.value || el.innerText || '').trim().slice(0, 60)
                             }));
                             return {
                                 total_anchors: anchors.length,
                                 table_rows: document.querySelectorAll('tr').length,
-                                doc_links_count: docLinks.length,
-                                sample_docs: docLinks.slice(0, 25),
-                                sample_rows: rows
+                                body_text: (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 2600),
+                                sample_rows: rows,
+                                anchors: anchors.slice(0, 35),
+                                inputs: inputs
                             };
                         }"""
                     )
@@ -345,65 +346,49 @@ def sync_adot_via_browser(
                         "status": p_status,
                         "title": p_title,
                         "rows": summary["table_rows"],
-                        "doc_links": summary["doc_links_count"],
                     }
                     probe_results.append(info)
                     print(
                         f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | "
-                        f"rows={summary['table_rows']} doc_links={summary['doc_links_count']}"
+                        f"rows={summary['table_rows']} anchors={summary['total_anchors']}"
                     )
-                    for s in summary["sample_docs"]:
-                        print(f"    DOC -> {s['text'][:60]!r} => {s['href'][:160]}")
+                    print(f"  BODY: {summary['body_text'][700:2400]}")
+                    for r in summary["sample_rows"][:6]:
+                        if r["text"]:
+                            print(f"  ROW: {r['text']} | links={r['links']}")
+                    if "e2c2" in p_url.lower():
+                        print(f"  INPUTS: {summary['inputs']}")
 
-                    candidate_pdfs: list[str] = []
-                    for s in summary["sample_docs"]:
-                        href_l = s["href"].lower()
-                        text_l = s["text"].lower()
-                        if not href_l.endswith(".pdf"):
-                            continue
-                        if "procurement-rules" in href_l or "-ad.pdf" in href_l or "advertisement" in href_l or "attendance" in href_l or "orgchart" in href_l:
-                            continue
-                        if "bid result" in text_l or "tab" in text_l or "/t-" in href_l:
-                            candidate_pdfs.append(_uj(p_url, s["href"]))
-
-                    if "solicitations.phoenix.gov" in p_url:
-                        detail_urls = [
-                            _uj(p_url, s["href"])
-                            for s in summary["sample_docs"]
-                            if "/solicitations/details/" in s["href"].lower()
+                    # For Mesa, fetch PDF bytes from inside browser JS so cookies/Referer/TLS match
+                    if "mesaaz.gov" in p_url:
+                        pdf_hrefs = [
+                            _uj(p_url, a["href"])
+                            for a in summary["anchors"]
+                            if a["href"].lower().endswith(".pdf")
+                            and ("/t-" in a["href"].lower() or "bid-tab" in a["href"].lower() or "result" in a["href"].lower())
                         ]
-                        for d_url in detail_urls[-2:]:
-                            print(f"  Visiting Phoenix detail: {d_url}")
-                            page.goto(d_url, wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_timeout(2000)
-                            body_txt = (page.inner_text("body") or "")[:900].replace("\n", " | ")
-                            print(f"  Phoenix detail body: {body_txt}")
-                            sub_links = page.eval_on_selector_all(
-                                "a[href]",
-                                "els => els.map(e => ({text: (e.innerText||'').trim(), href: e.getAttribute('href')||''})).filter(x => /pdf|file|download|tab|award|doc/i.test(x.href + ' ' + x.text))",
+                        print(f"  Mesa result PDFs found: {pdf_hrefs[:6]}")
+                        for pdf_url in pdf_hrefs[:2]:
+                            res = page.evaluate(
+                                """async (u) => {
+                                    const r = await fetch(u, {credentials: 'include'});
+                                    const buf = await r.arrayBuffer();
+                                    const bytes = new Uint8Array(buf);
+                                    let bin = '';
+                                    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                                    return {status: r.status, len: bytes.length, b64: btoa(bin)};
+                                }""",
+                                pdf_url,
                             )
-                            print(f"  Phoenix detail sub_links: {sub_links[:12]}")
-                            for sl in sub_links:
-                                if "solicitations.phoenix.gov" in _uj(d_url, sl["href"]) and sl["href"] not in ("/", "#"):
-                                    if any(k in (sl["href"] + sl["text"]).lower() for k in ("pdf", "download", "file", "tab")):
-                                        candidate_pdfs.append(_uj(d_url, sl["href"]))
-
-                    for pdf_url in candidate_pdfs[:3]:
-                        try:
-                            r_pdf = context.request.get(pdf_url, timeout=30000)
-                            b_pdf = r_pdf.body() if r_pdf.ok else b""
+                            b_pdf = _b64.b64decode(res["b64"]) if res["len"] else b""
                             print(
-                                f"  PDF check {pdf_url}: HTTP {r_pdf.status} bytes={len(b_pdf)} "
+                                f"  Mesa JS fetch {pdf_url}: HTTP {res['status']} bytes={res['len']} "
                                 f"is_pdf={b_pdf.lstrip().startswith(b'%PDF')}"
                             )
                             if b_pdf.lstrip().startswith(b"%PDF"):
                                 with _pp.open(_io.BytesIO(b_pdf)) as _pdf:
-                                    txt = "\n".join(
-                                        (pg.extract_text() or "") for pg in _pdf.pages[:2]
-                                    )[:2200]
-                                    print(f"  PDF pages={len(_pdf.pages)} text preview:\n{txt}\n---END PDF PREVIEW---")
-                        except Exception as pexc:
-                            print(f"  PDF check error: {pexc}")
+                                    txt = "\n".join((pg.extract_text() or "") for pg in _pdf.pages[:2])[:2200]
+                                    print(f"  Mesa PDF pages={len(_pdf.pages)} preview:\n{txt}\n---END MESA PDF---")
                 except Exception as exc:
                     probe_results.append({"url": p_url, "error": str(exc)})
                     print(f"Probe {p_url} failed: {exc}")

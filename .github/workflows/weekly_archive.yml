@@ -71,11 +71,10 @@ jobs:
           EXTRA_FLAGS=""
           if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
             EXTRA_FLAGS="--dry-run \
-              --probe-url https://solicitations.phoenix.gov/ \
+              --probe-url https://solicitations.phoenix.gov/Solicitations/Details/1840 \
               --probe-url https://www.mesaaz.gov/Business-Development/Engineering/Construction-Bid-Opportunities-and-Results \
-              --probe-url https://www.scottsdaleaz.gov/purchasing/procurement \
-              --probe-url https://www.tempe.gov/businesses/bids-solicitation-opportunities \
-              --probe-url https://paradisevalleyaz.bonfirehub.com/portal/?tab=pastOpportunities"
+              --probe-url https://scottsdaleaz.bonfirehub.com/portal/?tab=pastOpportunities \
+              --probe-url https://apps.azdot.gov/e2c2/HistoricalPrice.aspx"
           fi
           python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
 
