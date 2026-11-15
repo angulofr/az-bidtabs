@@ -163,6 +163,17 @@ def test_adot_bid_results_pdf_format(tmp_path: Path):
     assert ov["bid_lines"] == 6
     assert ov["contractors"] == 2
 
+    # Uploading E2C2 CSV containing the same TRACS should NOT overwrite named contractor PDF data
+    from src.scrapers.adot import ingest_e2c2_csv
+
+    e2c2_overlap = (
+        "DistName,Bid_Date,Item_Number,Description,Measure,Tracs_Number,Route,projname,length,Quantity,State,Bidder_1,Bidder_2,Bidder_3\n"
+        "SOUTHEAST DISTRICT,08/21/2026,2020009,REMOVAL OF STRUCTURAL CONCRETE,CU.YD.,F069101C,I-10,I-10 COCHISE,5.0,1.00,500.00,30000.00,3500.00,.00\n"
+    ).encode("utf-8")
+    res_e2c2 = ingest_e2c2_csv(e2c2_overlap, db_path)
+    assert res_e2c2["projects"] == 0
+    assert get_overview_stats(db_path)["bid_lines"] == 6
+
 
 
 

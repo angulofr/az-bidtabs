@@ -751,6 +751,19 @@ def ingest_e2c2_csv(
             if not grp_rows:
                 continue
 
+            existing_proj = conn.execute(
+                "SELECT project_id, awarded_contractor_id, source_url FROM projects WHERE agency = 'ADOT' AND agency_project_num = ?",
+                (tracs,),
+            ).fetchone()
+            if existing_proj:
+                ex_pid, ex_awd_cid, ex_src = existing_proj[0], existing_proj[1], existing_proj[2]
+                has_named_pdf = (
+                    ex_src == ADOT_BID_TABS_URL
+                    or (ex_awd_cid is not None and int(ex_awd_cid) not in bidder_cids.values())
+                )
+                if has_named_pdf:
+                    continue
+
             pid = upsert_project(
                 conn,
                 agency="ADOT",
