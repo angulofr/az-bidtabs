@@ -180,18 +180,19 @@ if page == "Market Overview":
         st.subheader("Recent Bid Lettings")
         rec_df = stats["recent_projects_df"]
         if not rec_df.empty:
-            display_rec = rec_df.copy()
-            display_rec["engineers_estimate"] = display_rec["engineers_estimate"].map(
-                lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
-            )
-            display_rec["winning_bid_total"] = display_rec["winning_bid_total"].map(
-                lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
-            )
             st.dataframe(
-                display_rec,
+                rec_df,
                 use_container_width=True,
                 hide_index=True,
                 height=340,
+                column_config={
+                    "engineers_estimate": st.column_config.NumberColumn(
+                        "Engineer's Estimate", format="$%,.0f"
+                    ),
+                    "winning_bid_total": st.column_config.NumberColumn(
+                        "Winning Bid Total", format="$%,.0f"
+                    ),
+                },
             )
 
 
@@ -338,7 +339,17 @@ elif page == "Pay Item Explorer":
         "bid_rank",
         "is_winner",
     ]
-    st.dataframe(df_filtered[show_cols], use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_filtered[show_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
+            "unit_price": st.column_config.NumberColumn("Unit Price", format="$%,.2f"),
+            "extended_total": st.column_config.NumberColumn("Extended Total", format="$%,.2f"),
+            "bid_rank": st.column_config.NumberColumn("Rank", format="%d"),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -352,17 +363,20 @@ elif page == "Competitor Intel & Head-to-Head":
     st.subheader("Contractor Scorecard")
 
     if not scorecard.empty:
-        disp_sc = scorecard.copy()
-        disp_sc["win_rate_pct"] = disp_sc["win_rate_pct"].map(lambda v: f"{v:.1f}%")
-        disp_sc["avg_pct_vs_ee"] = disp_sc["avg_pct_vs_ee"].map(
-            lambda v: f"{v:+.2f}%" if pd.notna(v) else "—"
-        )
-        disp_sc["total_bid_volume"] = disp_sc["total_bid_volume"].map(lambda v: f"${v:,.0f}")
-        disp_sc["won_volume"] = disp_sc["won_volume"].map(lambda v: f"${v:,.0f}")
         st.dataframe(
-            disp_sc.drop(columns=["contractor_id"]),
+            scorecard.drop(columns=["contractor_id"]),
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "contractor_name": "Contractor",
+                "az_roc_license": "AZ ROC License",
+                "total_bids": st.column_config.NumberColumn("Total Bids", format="%d"),
+                "wins": st.column_config.NumberColumn("Wins", format="%d"),
+                "win_rate_pct": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                "avg_pct_vs_ee": st.column_config.NumberColumn("Avg % vs. EE", format="%.2f%%"),
+                "total_bid_volume": st.column_config.NumberColumn("Total Bid Volume", format="$%,.0f"),
+                "won_volume": st.column_config.NumberColumn("Won Volume", format="$%,.0f"),
+            },
         )
 
     st.divider()
@@ -396,10 +410,29 @@ elif page == "Competitor Intel & Head-to-Head":
                     proj_h2h.drop(columns=["project_id"]),
                     use_container_width=True,
                     hide_index=True,
+                    column_config={
+                        "engineers_estimate": st.column_config.NumberColumn("Engineer's Est.", format="$%,.0f"),
+                        "a_total": st.column_config.NumberColumn("A Total", format="$%,.0f"),
+                        "a_rank": st.column_config.NumberColumn("A Rank", format="%d"),
+                        "b_total": st.column_config.NumberColumn("B Total", format="$%,.0f"),
+                        "b_rank": st.column_config.NumberColumn("B Rank", format="%d"),
+                        "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
+                    },
                 )
 
                 st.markdown("**Line-Item Unit Price Comparison (Sorted by $ Impact)**")
-                st.dataframe(line_h2h, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    line_h2h,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
+                        "a_unit_price": st.column_config.NumberColumn("A Unit Price", format="$%,.2f"),
+                        "b_unit_price": st.column_config.NumberColumn("B Unit Price", format="$%,.2f"),
+                        "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
+                        "extended_diff": st.column_config.NumberColumn("Extended Diff ($)", format="$%,.2f"),
+                    },
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +498,24 @@ elif page == "Schedule Benchmarker":
         s3.metric(f"Flagged (>{thresh:.0f}% off)", len(flagged))
         s4.metric("Total Variance vs. Median", f"${net_var:+,.0f}", delta=f"Your Bid: ${your_total:,.0f}")
 
-        st.dataframe(bm_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            bm_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
+                "your_unit_price": st.column_config.NumberColumn("Your Unit Price", format="$%,.2f"),
+                "your_extended": st.column_config.NumberColumn("Your Extended", format="$%,.2f"),
+                "match_score": st.column_config.NumberColumn("Match Score", format="%.1f"),
+                "observations": st.column_config.NumberColumn("Obs.", format="%d"),
+                "hist_p25": st.column_config.NumberColumn("Hist. P25", format="$%,.2f"),
+                "hist_median": st.column_config.NumberColumn("Hist. Median", format="$%,.2f"),
+                "hist_p75": st.column_config.NumberColumn("Hist. P75", format="$%,.2f"),
+                "hist_qty_wtd": st.column_config.NumberColumn("Qty-Wtd Avg", format="$%,.2f"),
+                "pct_vs_median": st.column_config.NumberColumn("% vs. Median", format="%.1f%%"),
+                "extended_vs_median": st.column_config.NumberColumn("Ext. Variance ($)", format="$%,.2f"),
+            },
+        )
 
         st.download_button(
             "Export Benchmarked Schedule CSV",
