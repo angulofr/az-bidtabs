@@ -74,8 +74,8 @@ jobs:
               --probe-url https://solicitations.phoenix.gov/ \
               --probe-url https://www.mesaaz.gov/Business-Development/Engineering/Construction-Bid-Opportunities-and-Results \
               --probe-url https://www.scottsdaleaz.gov/purchasing/procurement \
-              --probe-url https://www.chandleraz.gov/business/vendor-services/capital-projects/construction-bids \
-              --probe-url https://pima.bonfirehub.com/portal/?tab=pastOpportunities"
+              --probe-url https://www.tempe.gov/businesses/bids-solicitation-opportunities \
+              --probe-url https://paradisevalleyaz.bonfirehub.com/portal/?tab=pastOpportunities"
           fi
           python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
 

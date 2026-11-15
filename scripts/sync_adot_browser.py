@@ -300,6 +300,10 @@ def sync_adot_via_browser(
                     print(f"Sample[{idx}] dry-run check error: {exc}")
 
         if probe_urls:
+            import io as _io
+            from urllib.parse import urljoin as _uj
+            import pdfplumber as _pp
+
             for p_url in probe_urls:
                 try:
                     p_resp = page.goto(p_url, wait_until="domcontentloaded", timeout=45000)
@@ -317,7 +321,8 @@ def sync_adot_via_browser(
                                 const t = a.text.toLowerCase();
                                 return h.includes('.pdf') || h.includes('.xlsx') || h.includes('.csv')
                                     || t.includes('bid result') || t.includes('tabulation')
-                                    || h.includes('eservices') || h.includes('/awards') || h.includes('detail');
+                                    || t.includes('solicitation') || t.includes('bonfire')
+                                    || h.includes('bonfirehub') || h.includes('solicitations/details');
                             });
                             const rows = Array.from(document.querySelectorAll('table tr')).slice(0, 12).map(tr => ({
                                 text: (tr.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 180),
@@ -330,60 +335,73 @@ def sync_adot_via_browser(
                                 total_anchors: anchors.length,
                                 table_rows: document.querySelectorAll('tr').length,
                                 doc_links_count: docLinks.length,
-                                sample_docs: docLinks.slice(0, 10),
+                                sample_docs: docLinks.slice(0, 25),
                                 sample_rows: rows
                             };
                         }"""
                     )
-                    info = {"url": p_url, "status": p_status, "title": p_title, "rows": summary["table_rows"], "doc_links": summary["doc_links_count"]}
+                    info = {
+                        "url": p_url,
+                        "status": p_status,
+                        "title": p_title,
+                        "rows": summary["table_rows"],
+                        "doc_links": summary["doc_links_count"],
+                    }
                     probe_results.append(info)
-                    print(f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | rows={summary['table_rows']} doc_links={summary['doc_links_count']}")
+                    print(
+                        f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | "
+                        f"rows={summary['table_rows']} doc_links={summary['doc_links_count']}"
+                    )
                     for s in summary["sample_docs"]:
-                        print(f"    DOC -> {s['text'][:60]!r} => {s['href'][:140]}")
-                    for r in summary["sample_rows"]:
-                        if r["text"]:
-                            print(f"    ROW -> {r['text']} | links={r['links']}")
+                        print(f"    DOC -> {s['text'][:60]!r} => {s['href'][:160]}")
 
-                    # If Phoenix detail/file link or Mesa Bid Results PDF exists, inspect text!
-                    import pdfplumber as _pp
-                    import io as _io
-                    from urllib.parse import urljoin as _uj
-
-                    candidate_pdfs = [
-                        _uj(p_url, s["href"])
-                        for s in summary["sample_docs"]
-                        if "bid result" in s["text"].lower() or "tab" in s["text"].lower() or s["href"].lower().endswith(".pdf")
-                    ]
-                    if "solicitations.phoenix.gov" in p_url:
-                        for r in summary["sample_rows"]:
-                            for lk in r.get("links", []):
-                                d_url = _uj(p_url, lk["href"])
-                                if "/awards/" in d_url.lower() or "tab" in d_url.lower() or "solicitation" in d_url.lower():
-                                    print(f"  Visiting Phoenix row link: {d_url}")
-                                    page.goto(d_url, wait_until="domcontentloaded", timeout=30000)
-                                    page.wait_for_timeout(2000)
-                                    sub_links = page.eval_on_selector_all(
-                                        "a[href]",
-                                        "els => els.map(e => ({text: (e.innerText||'').trim(), href: e.getAttribute('href')||''})).filter(x => x.href.toLowerCase().includes('pdf') || x.href.toLowerCase().includes('file') || x.href.toLowerCase().includes('download') || x.href.toLowerCase().includes('tab') || x.text.toLowerCase().includes('tab'))",
-                                    )
-                                    print(f"  Phoenix detail sub_links: {sub_links[:8]}")
-                                    for sl in sub_links[:2]:
-                                        candidate_pdfs.append(_uj(d_url, sl["href"]))
-                                    break
-                            if candidate_pdfs:
-                                break
-
-                    for pdf_url in candidate_pdfs[:2]:
-                        if "procurement-rules" in pdf_url.lower() or "ad.pdf" in pdf_url.lower():
+                    candidate_pdfs: list[str] = []
+                    for s in summary["sample_docs"]:
+                        href_l = s["href"].lower()
+                        text_l = s["text"].lower()
+                        if not href_l.endswith(".pdf"):
                             continue
+                        if "procurement-rules" in href_l or "-ad.pdf" in href_l or "advertisement" in href_l or "attendance" in href_l or "orgchart" in href_l:
+                            continue
+                        if "bid result" in text_l or "tab" in text_l or "/t-" in href_l:
+                            candidate_pdfs.append(_uj(p_url, s["href"]))
+
+                    if "solicitations.phoenix.gov" in p_url:
+                        detail_urls = [
+                            _uj(p_url, s["href"])
+                            for s in summary["sample_docs"]
+                            if "/solicitations/details/" in s["href"].lower()
+                        ]
+                        for d_url in detail_urls[-2:]:
+                            print(f"  Visiting Phoenix detail: {d_url}")
+                            page.goto(d_url, wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(2000)
+                            body_txt = (page.inner_text("body") or "")[:900].replace("\n", " | ")
+                            print(f"  Phoenix detail body: {body_txt}")
+                            sub_links = page.eval_on_selector_all(
+                                "a[href]",
+                                "els => els.map(e => ({text: (e.innerText||'').trim(), href: e.getAttribute('href')||''})).filter(x => /pdf|file|download|tab|award|doc/i.test(x.href + ' ' + x.text))",
+                            )
+                            print(f"  Phoenix detail sub_links: {sub_links[:12]}")
+                            for sl in sub_links:
+                                if "solicitations.phoenix.gov" in _uj(d_url, sl["href"]) and sl["href"] not in ("/", "#"):
+                                    if any(k in (sl["href"] + sl["text"]).lower() for k in ("pdf", "download", "file", "tab")):
+                                        candidate_pdfs.append(_uj(d_url, sl["href"]))
+
+                    for pdf_url in candidate_pdfs[:3]:
                         try:
                             r_pdf = context.request.get(pdf_url, timeout=30000)
                             b_pdf = r_pdf.body() if r_pdf.ok else b""
-                            print(f"  PDF check {pdf_url}: HTTP {r_pdf.status} bytes={len(b_pdf)} is_pdf={b_pdf.lstrip().startswith(b'%PDF')}")
+                            print(
+                                f"  PDF check {pdf_url}: HTTP {r_pdf.status} bytes={len(b_pdf)} "
+                                f"is_pdf={b_pdf.lstrip().startswith(b'%PDF')}"
+                            )
                             if b_pdf.lstrip().startswith(b"%PDF"):
                                 with _pp.open(_io.BytesIO(b_pdf)) as _pdf:
-                                    txt = (_pdf.pages[0].extract_text() or "")[:1500]
-                                    print(f"  PDF page 1 text preview:\n{txt}\n---END PDF PREVIEW---")
+                                    txt = "\n".join(
+                                        (pg.extract_text() or "") for pg in _pdf.pages[:2]
+                                    )[:2200]
+                                    print(f"  PDF pages={len(_pdf.pages)} text preview:\n{txt}\n---END PDF PREVIEW---")
                         except Exception as pexc:
                             print(f"  PDF check error: {pexc}")
                 except Exception as exc:
