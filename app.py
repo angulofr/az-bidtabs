@@ -6,6 +6,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -23,6 +24,7 @@ from src.db import (
     get_database_url,
     get_filter_options,
     get_head_to_head,
+    get_item_code_details,
     get_overview_stats,
     init_db,
     is_postgres,
@@ -111,6 +113,7 @@ def check_access_gate() -> bool:
 if not check_access_gate():
     st.stop()
 
+
 def _get_config_flag(name: str) -> str:
     val = os.environ.get(name, "").strip().lower()
     if val:
@@ -143,6 +146,249 @@ if PROD_MODE:
 else:
     seed_database(DB_PATH)
 
+
+# ---------------------------------------------------------------------------
+# Clickable Item Code Links & New-Tab Detail Helpers
+# ---------------------------------------------------------------------------
+_ITEM_LINK_DISPLAY_RE = r"[?&]item=([^&]+)"
+
+
+def _get_base_app_url() -> str:
+    try:
+        raw_url = getattr(st.context, "url", None)
+        if raw_url:
+            parts = urlsplit(str(raw_url))
+            if parts.scheme and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        headers = getattr(st.context, "headers", None) or {}
+        host = headers.get("Host") or headers.get("host")
+        if host:
+            proto = headers.get("X-Forwarded-Proto") or headers.get("x-forwarded-proto") or "https"
+            return f"{proto}://{host}".rstrip("/")
+    except Exception:
+        pass
+    return ""
+
+
+def _build_item_detail_url(item_code: str, spec_system: str = "") -> str | None:
+    code = str(item_code or "").strip()
+    if not code:
+        return None
+    base = _get_base_app_url()
+    q_item = quote(code, safe="-._~")
+    spec = str(spec_system or "").strip().upper()
+    q_spec = f"&spec={quote(spec, safe='')}" if spec in ("ADOT", "MAG") else ""
+    prefix = base if base else ""
+    return f"{prefix}/?item={q_item}{q_spec}"
+
+
+def _with_clickable_item_links(
+    df: pd.DataFrame,
+    code_col: str = "item_code",
+    spec_col: str | None = "spec_system",
+) -> pd.DataFrame:
+    if df.empty or code_col not in df.columns:
+        return df
+    out = df.copy()
+    has_spec = bool(spec_col and spec_col in out.columns)
+    out[code_col] = [
+        _build_item_detail_url(c, s if has_spec else "")
+        for c, s in zip(
+            out[code_col],
+            out[spec_col] if has_spec else [""] * len(out),
+        )
+    ]
+    return out
+
+
+def _clear_item_query_param() -> None:
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+def _render_item_detail_page(item_code: str, initial_spec: str = "ALL") -> None:
+    top_l, top_r = st.columns([4, 1.3])
+    with top_r:
+        if st.button("← Back to Full Workspace", use_container_width=True):
+            _clear_item_query_param()
+            st.rerun()
+
+    opts = get_filter_options(DB_PATH)
+    spec_choices = ["ALL", "ADOT", "MAG"]
+    default_spec_idx = spec_choices.index(initial_spec) if initial_spec in spec_choices else 0
+
+    f1, f2, f3, f4 = st.columns([1.4, 0.9, 1.3, 1.3])
+    code_input = f1.text_input("Pay Item Code", value=item_code)
+    spec_sel = f2.selectbox("Spec System", spec_choices, index=default_spec_idx)
+    ag_sel = f3.multiselect("Filter by Agency", opts["agencies"])
+    co_sel = f4.multiselect("Filter by County", opts["counties"])
+
+    t1, t2, _ = st.columns([1.2, 1.8, 2.0])
+    winners_only_item = t1.toggle("Winning Bids Only", value=False)
+    include_ee_rows = t2.toggle("Include Department / Engineer's Estimate in Lines", value=True)
+
+    active_code = code_input.strip() or item_code
+    contractor_summary, all_lines = get_item_code_details(
+        active_code,
+        DB_PATH,
+        spec_system=spec_sel,
+        agencies=ag_sel or None,
+        counties=co_sel or None,
+        winners_only=winners_only_item,
+    )
+
+    if all_lines.empty:
+        with top_l:
+            st.title(f"Pay Item Detail: {active_code}")
+        st.warning(f"No bid line observations found for item code `{active_code}` with the current filters.")
+        return
+
+    descs = [str(d).strip() for d in all_lines["description"].dropna().unique() if str(d).strip()]
+    units = [str(u).strip() for u in all_lines["unit"].dropna().unique() if str(u).strip()]
+    specs = [str(s).strip() for s in all_lines["spec_system"].dropna().unique() if str(s).strip()]
+
+    with top_l:
+        st.title(f"{' / '.join(specs)} | {active_code} — {descs[0] if descs else ''}")
+        st.caption(
+            f"Unit(s): **{', '.join(units) or '—'}** • Cross-contractor pricing & bid history across all archived projects"
+        )
+
+    contractor_lines = all_lines[all_lines["is_engineers_estimate"] == 0]
+    ee_lines = all_lines[all_lines["is_engineers_estimate"] == 1]
+    stats_c = compute_unit_price_stats(contractor_lines)
+    ee_median = float(ee_lines["unit_price"].median()) if not ee_lines.empty else None
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Contractors", f"{len(contractor_summary):,}")
+    k2.metric("Projects", f"{int(all_lines['project_id'].nunique()):,}")
+    k3.metric("Contractor Bids", f"{stats_c['observations']:,}")
+    k4.metric("Median Price", f"${stats_c['median']:,.2f}" if stats_c["observations"] else "—")
+    k5.metric("Qty-Wtd Avg", f"${stats_c['qty_weighted_avg']:,.2f}" if stats_c["observations"] else "—")
+    k6.metric("Dept. Est. Median", f"${ee_median:,.2f}" if ee_median is not None else "—")
+
+    st.subheader("All Contractors — Unit Price Breakdown")
+    if not contractor_summary.empty:
+        st.dataframe(
+            contractor_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "contractor_name": "Contractor",
+                "approx_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
+                "observations": st.column_config.NumberColumn("Bid Lines", format="%d"),
+                "projects": st.column_config.NumberColumn("Projects", format="%d"),
+                "wins": st.column_config.NumberColumn("Wins", format="%d"),
+                "min_unit_price": st.column_config.NumberColumn("Min Unit Price", format="$%,.2f"),
+                "median_unit_price": st.column_config.NumberColumn("Median Unit Price", format="$%,.2f"),
+                "qty_weighted_avg": st.column_config.NumberColumn("Qty-Wtd Avg", format="$%,.2f"),
+                "max_unit_price": st.column_config.NumberColumn("Max Unit Price", format="$%,.2f"),
+                "total_quantity": st.column_config.NumberColumn("Total Qty Bid", format="%,.0f"),
+                "total_extended": st.column_config.NumberColumn("Total Extended", format="$%,.2f"),
+            },
+        )
+    else:
+        st.info("Only Department / Engineer's Estimate rows exist for this item under the current filters.")
+
+    if not contractor_lines.empty:
+        st.subheader("Unit Price vs. Quantity Across Contractors")
+        plot_df = (all_lines if include_ee_rows else contractor_lines).copy()
+        plot_df["bid_role"] = plot_df.apply(
+            lambda r: "Department Estimate"
+            if r["is_engineers_estimate"] == 1
+            else ("Winning Bid" if r["is_winner"] == 1 else "Competing Bid"),
+            axis=1,
+        )
+        fig = px.scatter(
+            plot_df,
+            x="quantity",
+            y="unit_price",
+            color="bidder_name",
+            symbol="bid_role",
+            hover_data={
+                "agency": True,
+                "agency_project_num": True,
+                "project_title": True,
+                "letting_date": True,
+                "unit": True,
+                "bid_rank": True,
+                "quantity": ":,.0f",
+                "unit_price": ":$,.2f",
+            },
+            labels={
+                "quantity": f"Quantity ({units[0] if units else 'Unit'})",
+                "unit_price": "Unit Price ($)",
+                "bidder_name": "Contractor / Estimate",
+                "bid_role": "Role",
+            },
+        )
+        if stats_c["observations"] > 0:
+            fig.add_hline(
+                y=stats_c["median"],
+                line_dash="dash",
+                line_color="#0F172A",
+                annotation_text=f"Contractor Median: ${stats_c['median']:,.2f}",
+            )
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    tbl_df = (all_lines if include_ee_rows else contractor_lines).copy()
+    tbl_df["is_winner"] = tbl_df["is_winner"].fillna(0).astype(bool)
+    col_t, col_d = st.columns([4, 1])
+    col_t.subheader("Every Bid Line for This Item Code")
+    col_d.download_button(
+        label="Export Item CSV",
+        data=tbl_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"az_bidtabs_item_{active_code}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    detail_cols = [
+        "letting_date",
+        "agency",
+        "agency_project_num",
+        "project_title",
+        "county",
+        "spec_system",
+        "description",
+        "unit",
+        "bidder_name",
+        "bidder_employees",
+        "quantity",
+        "unit_price",
+        "extended_total",
+        "bid_rank",
+        "is_winner",
+    ]
+    st.dataframe(
+        tbl_df[detail_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "letting_date": "Letting Date",
+            "agency": "Agency",
+            "agency_project_num": "Project #",
+            "project_title": "Project Title",
+            "county": "County",
+            "spec_system": "Spec",
+            "description": "Description",
+            "unit": "Unit",
+            "bidder_name": "Contractor / Estimate",
+            "bidder_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
+            "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
+            "unit_price": st.column_config.NumberColumn("Unit Price", format="$%,.2f"),
+            "extended_total": st.column_config.NumberColumn("Extended Total", format="$%,.2f"),
+            "bid_rank": st.column_config.NumberColumn("Rank", format="%d"),
+            "is_winner": st.column_config.CheckboxColumn("Winner"),
+        },
+    )
+
+
+qp_item = unquote(str(st.query_params.get("item", "") or "").strip())
+qp_spec = str(st.query_params.get("spec", "ALL") or "ALL").strip().upper()
+
+
 # ---------------------------------------------------------------------------
 # Sidebar Navigation
 # ---------------------------------------------------------------------------
@@ -167,6 +413,7 @@ with st.sidebar:
             "Ingestion & Scrapers",
         ],
         label_visibility="collapsed",
+        on_change=_clear_item_query_param,
     )
 
     st.divider()
@@ -180,9 +427,15 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
+# Dedicated New-Tab Pay Item Detail View (when ?item=<code> is in URL)
+# ---------------------------------------------------------------------------
+if qp_item:
+    _render_item_detail_page(qp_item, qp_spec)
+
+# ---------------------------------------------------------------------------
 # Page 1: Market Overview
 # ---------------------------------------------------------------------------
-if page == "Market Overview":
+elif page == "Market Overview":
     st.title("Arizona Heavy-Civil Market Overview")
     st.caption(
         "Unified bid tabulation archive across **ADOT** and **Municipal / MAG** agencies "
@@ -385,11 +638,17 @@ elif page == "Pay Item Explorer":
         "bid_rank",
         "is_winner",
     ]
+    st.caption("Tip: Click any **Item Code** below to open all-contractor pricing details in a new tab.")
     st.dataframe(
-        df_filtered[show_cols],
+        _with_clickable_item_links(df_filtered[show_cols], "item_code", "spec_system"),
         use_container_width=True,
         hide_index=True,
         column_config={
+            "item_code": st.column_config.LinkColumn(
+                "Item Code",
+                help="Open all-contractor details for this item code in a new tab",
+                display_text=_ITEM_LINK_DISPLAY_RE,
+            ),
             "bidder_name": "Bidder",
             "bidder_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
             "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
@@ -487,11 +746,17 @@ elif page == "Competitor Intel & Head-to-Head":
                 )
 
                 st.markdown("**Line-Item Unit Price Comparison (Sorted by $ Impact)**")
+                st.caption("Tip: Click any **Item Code** below to open a new tab with pricing from **all contractors**.")
                 st.dataframe(
-                    line_h2h,
+                    _with_clickable_item_links(line_h2h, "item_code", "spec_system"),
                     use_container_width=True,
                     hide_index=True,
                     column_config={
+                        "item_code": st.column_config.LinkColumn(
+                            "Item Code",
+                            help="Open all-contractor details for this item code in a new tab",
+                            display_text=_ITEM_LINK_DISPLAY_RE,
+                        ),
                         "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
                         "a_unit_price": st.column_config.NumberColumn("A Unit Price", format="$%,.2f"),
                         "b_unit_price": st.column_config.NumberColumn("B Unit Price", format="$%,.2f"),
@@ -564,11 +829,17 @@ elif page == "Schedule Benchmarker":
         s3.metric(f"Flagged (>{thresh:.0f}% off)", len(flagged))
         s4.metric("Total Variance vs. Median", f"${net_var:+,.0f}", delta=f"Your Bid: ${your_total:,.0f}")
 
+        st.caption("Tip: Click any **Matched Code** below to open all-contractor pricing details in a new tab.")
         st.dataframe(
-            bm_df,
+            _with_clickable_item_links(bm_df, "matched_code", "matched_spec"),
             use_container_width=True,
             hide_index=True,
             column_config={
+                "matched_code": st.column_config.LinkColumn(
+                    "Matched Code",
+                    help="Open all-contractor details for this matched item code in a new tab",
+                    display_text=_ITEM_LINK_DISPLAY_RE,
+                ),
                 "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
                 "your_unit_price": st.column_config.NumberColumn("Your Unit Price", format="$%,.2f"),
                 "your_extended": st.column_config.NumberColumn("Your Extended", format="$%,.2f"),

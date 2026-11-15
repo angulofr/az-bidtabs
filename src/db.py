@@ -640,6 +640,116 @@ def compute_unit_price_stats(df: pd.DataFrame) -> dict[str, float | int]:
     }
 
 
+def get_item_code_details(
+    item_code: str,
+    db_path: Path | str | None = None,
+    *,
+    spec_system: str = "ALL",
+    agencies: list[str] | None = None,
+    counties: list[str] | None = None,
+    winners_only: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (contractor_summary_df, all_lines_df) for an exact pay item code across all contractors."""
+    code = normalize_item_code(item_code)
+    if not code:
+        return pd.DataFrame(), pd.DataFrame()
+
+    sql = """
+        SELECT
+            bl.bid_line_id,
+            pi.item_id,
+            pi.spec_system,
+            pi.item_code,
+            pi.description,
+            pi.unit,
+            pi.category,
+            p.project_id,
+            p.agency,
+            p.agency_project_num,
+            p.title AS project_title,
+            p.county,
+            p.letting_date,
+            COALESCE(c.canonical_name, 'DEPARTMENT ESTIMATE') AS bidder_name,
+            c.approx_employees AS bidder_employees,
+            bl.is_engineers_estimate,
+            bl.quantity,
+            bl.unit_price,
+            bl.extended_total,
+            bl.bid_rank,
+            bl.is_winner
+        FROM bid_lines bl
+        JOIN pay_items pi ON bl.item_id = pi.item_id
+        JOIN projects p ON bl.project_id = p.project_id
+        LEFT JOIN contractors c ON bl.contractor_id = c.contractor_id
+        WHERE UPPER(pi.item_code) = ?
+    """
+    params: list[Any] = [code]
+
+    if spec_system in ("ADOT", "MAG"):
+        sql += " AND pi.spec_system = ?"
+        params.append(spec_system)
+
+    if agencies:
+        placeholders = ",".join("?" for _ in agencies)
+        sql += f" AND p.agency IN ({placeholders})"
+        params.extend(agencies)
+
+    if counties:
+        placeholders = ",".join("?" for _ in counties)
+        sql += f" AND p.county IN ({placeholders})"
+        params.extend(counties)
+
+    if winners_only:
+        sql += " AND (bl.is_winner = 1 OR bl.is_engineers_estimate = 1)"
+
+    sql += " ORDER BY p.letting_date DESC, p.agency_project_num, bl.is_engineers_estimate DESC, bl.bid_rank ASC, bl.unit_price ASC"
+
+    with db_session(db_path) as conn:
+        all_lines_df = conn.query_df(sql, params)
+
+    if all_lines_df.empty:
+        return pd.DataFrame(), all_lines_df
+
+    for col in ["quantity", "unit_price", "extended_total", "bid_rank", "bidder_employees", "is_engineers_estimate", "is_winner"]:
+        if col in all_lines_df.columns:
+            all_lines_df[col] = pd.to_numeric(all_lines_df[col], errors="coerce")
+
+    contractor_lines = all_lines_df[all_lines_df["is_engineers_estimate"] == 0]
+    if contractor_lines.empty:
+        return pd.DataFrame(), all_lines_df
+
+    summary_rows: list[dict[str, Any]] = []
+    for cname, grp in contractor_lines.groupby("bidder_name", sort=False):
+        prices = grp["unit_price"].astype(float).to_numpy()
+        qtys = grp["quantity"].astype(float).to_numpy()
+        exts = grp["extended_total"].astype(float).to_numpy()
+        total_qty = float(np.sum(qtys))
+        qw_avg = float(np.sum(prices * qtys) / total_qty) if total_qty > 0 else float(np.mean(prices))
+        emp_vals = grp["bidder_employees"].dropna()
+        summary_rows.append(
+            {
+                "contractor_name": cname,
+                "approx_employees": int(emp_vals.iloc[0]) if not emp_vals.empty else None,
+                "observations": int(len(grp)),
+                "projects": int(grp["project_id"].nunique()),
+                "wins": int(grp["is_winner"].fillna(0).sum()),
+                "min_unit_price": float(np.min(prices)),
+                "median_unit_price": float(np.percentile(prices, 50)),
+                "qty_weighted_avg": qw_avg,
+                "max_unit_price": float(np.max(prices)),
+                "total_quantity": total_qty,
+                "total_extended": float(np.sum(exts)),
+            }
+        )
+
+    contractor_summary_df = pd.DataFrame(summary_rows).sort_values(
+        by=["observations", "wins", "median_unit_price"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    return contractor_summary_df, all_lines_df
+
+
+
 def get_contractor_scorecard(db_path: Path | str | None = None) -> pd.DataFrame:
     """Compute contractor win-rate, avg % vs Engineer's Estimate, and bid volume."""
     sql = """

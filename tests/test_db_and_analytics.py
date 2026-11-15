@@ -138,3 +138,93 @@ def test_head_to_head_avoids_cartesian_join_on_multi_line_items(tmp_path: Path):
     }
 
 
+def test_get_item_code_details_all_contractors(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_item_code_details,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+    )
+
+    db_path = tmp_path / "item_detail.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        cid_a = upsert_contractor(conn, "ALPHA PAVING INC", approx_employees=120)
+        cid_b = upsert_contractor(conn, "BETA CIVIL LLC", approx_employees=85)
+        cid_c = upsert_contractor(conn, "GAMMA STRIPING CORP", approx_employees=40)
+        pid = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="2025115",
+            title="ADOT Project 2025115",
+            letting_date="2025-11-01",
+            engineers_estimate=50000.0,
+            winning_bid_total=45000.0,
+            awarded_contractor_id=cid_a,
+        )
+        item_target = upsert_pay_item(
+            conn,
+            "ADOT",
+            "7015052",
+            "OBLITERATE PAVEMENT MARKING (STRIPE)",
+            "L.FT.",
+        )
+        item_other = upsert_pay_item(
+            conn,
+            "ADOT",
+            "70150520",
+            "OTHER SIMILAR PREFIX CODE",
+            "L.FT.",
+        )
+        # Department estimate + 3 contractors on 7015052
+        insert_bid_line(
+            conn,
+            project_id=pid,
+            contractor_id=None,
+            is_engineers_estimate=True,
+            item_id=item_target,
+            quantity=10000.0,
+            unit_price=0.50,
+        )
+        for cid, rank, price, winner in [
+            (cid_a, 1, 0.33, True),
+            (cid_b, 2, 0.40, False),
+            (cid_c, 3, 0.55, False),
+        ]:
+            insert_bid_line(
+                conn,
+                project_id=pid,
+                contractor_id=cid,
+                is_engineers_estimate=False,
+                item_id=item_target,
+                quantity=10000.0,
+                unit_price=price,
+                bid_rank=rank,
+                is_winner=winner,
+            )
+        # Unrelated prefix code should NOT match exact item_code lookup
+        insert_bid_line(
+            conn,
+            project_id=pid,
+            contractor_id=cid_a,
+            is_engineers_estimate=False,
+            item_id=item_other,
+            quantity=500.0,
+            unit_price=9.99,
+            bid_rank=1,
+            is_winner=True,
+        )
+
+    summary_df, lines_df = get_item_code_details("7015052", db_path, spec_system="ADOT")
+    assert len(summary_df) == 3
+    assert set(summary_df["contractor_name"]) == {"ALPHA PAVING", "BETA CIVIL", "GAMMA STRIPING"}
+    assert len(lines_df) == 4  # 3 contractors + 1 Department Estimate
+    assert set(lines_df["item_code"]) == {"7015052"}
+    assert "DEPARTMENT ESTIMATE" in set(lines_df["bidder_name"])
+
+
+
