@@ -168,7 +168,7 @@ if page == "Market Overview":
                 y="agency",
                 orientation="h",
                 color="awarded_volume",
-                color_continuous_scale="Amber",
+                color_continuous_scale="YlOrBr",
                 labels={"projects": "Projects", "agency": "Agency", "awarded_volume": "Awarded ($)"},
             )
             fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis={"categoryorder": "total ascending"})
