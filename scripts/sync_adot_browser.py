@@ -317,29 +317,75 @@ def sync_adot_via_browser(
                                 const t = a.text.toLowerCase();
                                 return h.includes('.pdf') || h.includes('.xlsx') || h.includes('.csv')
                                     || t.includes('bid result') || t.includes('tabulation')
-                                    || h.includes('download') || h.includes('file') || h.includes('award');
+                                    || h.includes('eservices') || h.includes('/awards') || h.includes('detail');
                             });
+                            const rows = Array.from(document.querySelectorAll('table tr')).slice(0, 12).map(tr => ({
+                                text: (tr.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 180),
+                                links: Array.from(tr.querySelectorAll('a[href]')).map(a => ({
+                                    text: (a.innerText || '').trim().slice(0, 50),
+                                    href: a.getAttribute('href') || ''
+                                }))
+                            }));
                             return {
                                 total_anchors: anchors.length,
                                 table_rows: document.querySelectorAll('tr').length,
                                 doc_links_count: docLinks.length,
-                                sample_docs: docLinks.slice(0, 6)
+                                sample_docs: docLinks.slice(0, 10),
+                                sample_rows: rows
                             };
                         }"""
                     )
-                    info = {
-                        "url": p_url,
-                        "status": p_status,
-                        "title": p_title,
-                        **summary,
-                    }
+                    info = {"url": p_url, "status": p_status, "title": p_title, "rows": summary["table_rows"], "doc_links": summary["doc_links_count"]}
                     probe_results.append(info)
-                    print(
-                        f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | "
-                        f"rows={summary['table_rows']} doc_links={summary['doc_links_count']}"
-                    )
+                    print(f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | rows={summary['table_rows']} doc_links={summary['doc_links_count']}")
                     for s in summary["sample_docs"]:
-                        print(f"    -> {s['text'][:60]!r} => {s['href'][:120]}")
+                        print(f"    DOC -> {s['text'][:60]!r} => {s['href'][:140]}")
+                    for r in summary["sample_rows"]:
+                        if r["text"]:
+                            print(f"    ROW -> {r['text']} | links={r['links']}")
+
+                    # If Phoenix detail/file link or Mesa Bid Results PDF exists, inspect text!
+                    import pdfplumber as _pp
+                    import io as _io
+                    from urllib.parse import urljoin as _uj
+
+                    candidate_pdfs = [
+                        _uj(p_url, s["href"])
+                        for s in summary["sample_docs"]
+                        if "bid result" in s["text"].lower() or "tab" in s["text"].lower() or s["href"].lower().endswith(".pdf")
+                    ]
+                    if "solicitations.phoenix.gov" in p_url:
+                        for r in summary["sample_rows"]:
+                            for lk in r.get("links", []):
+                                d_url = _uj(p_url, lk["href"])
+                                if "/awards/" in d_url.lower() or "tab" in d_url.lower() or "solicitation" in d_url.lower():
+                                    print(f"  Visiting Phoenix row link: {d_url}")
+                                    page.goto(d_url, wait_until="domcontentloaded", timeout=30000)
+                                    page.wait_for_timeout(2000)
+                                    sub_links = page.eval_on_selector_all(
+                                        "a[href]",
+                                        "els => els.map(e => ({text: (e.innerText||'').trim(), href: e.getAttribute('href')||''})).filter(x => x.href.toLowerCase().includes('pdf') || x.href.toLowerCase().includes('file') || x.href.toLowerCase().includes('download') || x.href.toLowerCase().includes('tab') || x.text.toLowerCase().includes('tab'))",
+                                    )
+                                    print(f"  Phoenix detail sub_links: {sub_links[:8]}")
+                                    for sl in sub_links[:2]:
+                                        candidate_pdfs.append(_uj(d_url, sl["href"]))
+                                    break
+                            if candidate_pdfs:
+                                break
+
+                    for pdf_url in candidate_pdfs[:2]:
+                        if "procurement-rules" in pdf_url.lower() or "ad.pdf" in pdf_url.lower():
+                            continue
+                        try:
+                            r_pdf = context.request.get(pdf_url, timeout=30000)
+                            b_pdf = r_pdf.body() if r_pdf.ok else b""
+                            print(f"  PDF check {pdf_url}: HTTP {r_pdf.status} bytes={len(b_pdf)} is_pdf={b_pdf.lstrip().startswith(b'%PDF')}")
+                            if b_pdf.lstrip().startswith(b"%PDF"):
+                                with _pp.open(_io.BytesIO(b_pdf)) as _pdf:
+                                    txt = (_pdf.pages[0].extract_text() or "")[:1500]
+                                    print(f"  PDF page 1 text preview:\n{txt}\n---END PDF PREVIEW---")
+                        except Exception as pexc:
+                            print(f"  PDF check error: {pexc}")
                 except Exception as exc:
                     probe_results.append({"url": p_url, "error": str(exc)})
                     print(f"Probe {p_url} failed: {exc}")

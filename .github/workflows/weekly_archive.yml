@@ -73,14 +73,9 @@ jobs:
             EXTRA_FLAGS="--dry-run \
               --probe-url https://solicitations.phoenix.gov/ \
               --probe-url https://www.mesaaz.gov/Business-Development/Engineering/Construction-Bid-Opportunities-and-Results \
-              --probe-url https://www.tempe.gov/government/public-works/engineering/bid-results \
-              --probe-url https://www.tempe.gov/government/financial-services/procurement/bid-results-solicitation-status \
-              --probe-url https://www.chandleraz.gov/business/vendor-services/capital-projects/construction-bids \
-              --probe-url https://www.yumaaz.gov/business/city-bids \
-              --probe-url https://www.phoenix.gov/administration/departments/city-engineer/design-and-construction-procurement0.html \
               --probe-url https://www.scottsdaleaz.gov/purchasing/procurement \
-              --probe-url https://www.glendaleaz.gov/Departments/Engineering \
-              --probe-url https://app.az.gov/page/search-opportunities"
+              --probe-url https://www.chandleraz.gov/business/vendor-services/capital-projects/construction-bids \
+              --probe-url https://pima.bonfirehub.com/portal/?tab=pastOpportunities"
           fi
           python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
 
