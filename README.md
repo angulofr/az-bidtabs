@@ -30,6 +30,21 @@ Run tests:
 pytest -v
 ```
 
+## Automated Weekly ADOT Sync (Windows / Mac)
+Because `azdot.gov` blocks datacenter/cloud IPs, run the local Playwright sync script on your PC (or schedule it weekly in Windows Task Scheduler):
+
+1. Create `.env.local` in the repo root with your Neon connection string:
+   ```env
+   DATABASE_URL=postgresql://...
+   ```
+2. Double-click `scripts\sync_adot_windows.bat` (or run from terminal):
+   ```bash
+   pip install -r requirements.txt playwright
+   playwright install chromium
+   python scripts/sync_adot_browser.py --limit 100 --save-dir data/adot_pdfs
+   ```
+   It skips already-archived TRACS numbers, downloads only new ADOT Bid Tab PDFs, parses all bidders & line items, and inserts directly into Neon Postgres.
+
 ## Deploying to Streamlit Community Cloud (Production Mode + Postgres)
 1. Create a free Postgres database on [Supabase](https://supabase.com) or [Neon](https://neon.tech) and copy the connection URI (`postgresql://...`).
 2. Push this repository to GitHub and deploy `app.py` on [share.streamlit.io](https://share.streamlit.io).

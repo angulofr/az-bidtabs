@@ -240,7 +240,11 @@ def parse_adot_bid_tab_pdf(
     full_text = "\n".join(all_text_lines)
 
     # Extract TRACS number (e.g. F069101C, H687001C) or Proposal Pamphlet ID (e.g. 2026005)
-    tracs_match = re.search(r"\b([FH]\d{3,5}[0-9A-Z]{2,4})\b", f"{src_name}\n{full_text}", re.IGNORECASE)
+    tracs_match = re.search(
+        r"(?<![A-Z0-9])([FH]\d{3,5}[0-9A-Z]{2,4})(?![A-Z0-9])",
+        f"{src_name}\n{full_text}",
+        re.IGNORECASE,
+    )
     pamphlet_match = re.search(
         r"(?:BID\s+RESULTS\s+FOR|PROPOSAL\s+PAMPHLET)\s+([A-Z0-9\-]+)",
         full_text,

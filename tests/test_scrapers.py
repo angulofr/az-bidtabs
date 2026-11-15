@@ -175,5 +175,13 @@ def test_adot_bid_results_pdf_format(tmp_path: Path):
     assert get_overview_stats(db_path)["bid_lines"] == 6
 
 
+def test_sync_adot_browser_tracs_helper():
+    from scripts.sync_adot_browser import extract_tracs_from_text
+
+    assert extract_tracs_from_text("073 GI 333 F069101C Bid Tabs.pdf") == "F069101C"
+    assert extract_tracs_from_text("https://azdot.gov/H687001C_BidTabs.pdf") == "H687001C"
+    assert extract_tracs_from_text("Unrelated Document.pdf") is None
+
+
 
 
