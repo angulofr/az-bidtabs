@@ -138,3 +138,49 @@ def parse_opengov_bid_tab_export(
             )
         )
     return parsed
+
+
+def run_phoenix_opengov_sync(
+    db_path: str | Any = None,
+    *,
+    limit: int = 25,
+    dry_run: bool = False,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Fetch recent City of Phoenix OpenGov solicitations and record new projects."""
+    from src.db import DEFAULT_DB_PATH, db_session, upsert_project
+
+    target_db = db_path or DEFAULT_DB_PATH
+    solicitations = fetch_phoenix_opengov_solicitations(limit=limit, session=session)
+
+    with db_session(target_db) as conn:
+        existing_nums = {
+            r[0]
+            for r in conn.execute(
+                "SELECT agency_project_num FROM projects WHERE agency = 'City of Phoenix'"
+            ).fetchall()
+        }
+        new_count = 0
+        skipped = 0
+        for sol in solicitations:
+            if not sol.project_num or sol.project_num in existing_nums:
+                skipped += 1
+                continue
+            if not dry_run:
+                upsert_project(
+                    conn,
+                    agency="City of Phoenix",
+                    agency_project_num=sol.project_num,
+                    title=sol.title or f"City of Phoenix {sol.project_num}",
+                    county="Maricopa",
+                    letting_date=sol.due_date[:10] if sol.due_date else None,
+                    source_url=sol.url,
+                )
+            new_count += 1
+
+    return {
+        "discovered": len(solicitations),
+        "ingested": new_count,
+        "skipped": skipped,
+    }
+

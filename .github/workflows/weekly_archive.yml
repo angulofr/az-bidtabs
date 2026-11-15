@@ -1,0 +1,37 @@
+name: Weekly ADOT & MAG Bid Tab Archive
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC (before ADOT's ~4-month bid tab expiry)
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max items to check per source"
+        required: false
+        default: "30"
+
+jobs:
+  archive-bidtabs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run unit & integration tests
+        run: pytest -v
+
+      - name: Run weekly ADOT & Phoenix OpenGov sync
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '30' }}"
+          python scripts/archive_weekly.py --limit "$LIMIT"

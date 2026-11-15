@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import pdfplumber
 import requests
@@ -317,3 +318,102 @@ def ingest_parsed_project(
                 is_winner=line.is_winner,
             )
         return project_id
+
+
+def discover_adot_bid_tab_pdfs(
+    url: str = ADOT_BID_TABS_URL,
+    *,
+    limit: int = 50,
+    timeout: int = 20,
+    session: requests.Session | None = None,
+) -> list[dict[str, str]]:
+    """Discover active ADOT Bid Tabulation PDF links before ADOT's ~4-month expiry."""
+    sess = session or requests.Session()
+    sess.headers.update(
+        {"User-Agent": "AZ-BidTabs/1.0 (+https://azbidtabs.example; heavy-civil-intel)"}
+    )
+    resp = sess.get(url, timeout=timeout)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    discovered: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for a in soup.select("a[href]"):
+        href = str(a.get("href", "")).strip()
+        if ".pdf" not in href.lower():
+            continue
+        full_url = urljoin(url, href)
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+
+        link_text = a.get_text(" ", strip=True) or Path(href.split("?")[0]).stem
+        tracs_match = re.search(r"\b([FH]\d{3,5}[0-9A-Z]{2,4})\b", f"{link_text} {href}", re.IGNORECASE)
+        proj_num = tracs_match.group(1).upper() if tracs_match else Path(href.split("?")[0]).stem[:24]
+        discovered.append(
+            {
+                "url": full_url,
+                "title": link_text,
+                "project_num": proj_num,
+            }
+        )
+        if len(discovered) >= limit:
+            break
+    return discovered
+
+
+def run_adot_archive_sync(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    *,
+    limit: int = 25,
+    dry_run: bool = False,
+    timeout: int = 25,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Discover, download, parse, and archive ADOT bid tab PDFs not yet in SQLite."""
+    sess = session or requests.Session()
+    links = discover_adot_bid_tab_pdfs(limit=limit, timeout=timeout, session=sess)
+
+    with db_session(db_path) as conn:
+        existing_nums = {
+            r[0]
+            for r in conn.execute(
+                "SELECT agency_project_num FROM projects WHERE agency = 'ADOT'"
+            ).fetchall()
+        }
+
+    ingested = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for item in links:
+        if item["project_num"] in existing_nums:
+            skipped += 1
+            continue
+        if dry_run:
+            ingested += 1
+            continue
+        try:
+            pdf_resp = sess.get(item["url"], timeout=timeout)
+            pdf_resp.raise_for_status()
+            parsed = parse_adot_bid_tab_pdf(pdf_resp.content)
+            if parsed.agency_project_num == "ADOT-UNKNOWN":
+                parsed.agency_project_num = item["project_num"]
+            if not parsed.title or parsed.title.startswith("ADOT Project "):
+                parsed.title = item["title"]
+            parsed.source_url = item["url"]
+            if parsed.lines:
+                ingest_parsed_project(parsed, db_path)
+                ingested += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            errors.append(f"{item['project_num']}: {exc}")
+
+    return {
+        "discovered": len(links),
+        "ingested": ingested,
+        "skipped": skipped,
+        "errors": errors,
+    }
+

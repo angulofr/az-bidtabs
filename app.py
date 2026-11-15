@@ -23,11 +23,13 @@ from src.matching import benchmark_schedule
 from src.scrapers.adot import (
     ingest_parsed_project,
     parse_adot_bid_tab_pdf,
+    run_adot_archive_sync,
     scrape_adot_e2c2_historical,
 )
 from src.scrapers.phoenix_opengov import (
     fetch_phoenix_opengov_solicitations,
     parse_opengov_bid_tab_export,
+    run_phoenix_opengov_sync,
 )
 from src.seed import seed_database
 
@@ -523,6 +525,18 @@ elif page == "Ingestion & Scrapers":
     with tab_live:
         c_e2c2, c_phx, c_reset = st.columns(3)
         with c_e2c2:
+            if st.button("Sync ADOT Bid Tab PDFs", type="primary"):
+                try:
+                    res = run_adot_archive_sync(DB_PATH, limit=15)
+                    st.success(
+                        f"Discovered {res['discovered']} PDFs | "
+                        f"Ingested: {res['ingested']} | Skipped: {res['skipped']}"
+                    )
+                    if res["errors"]:
+                        st.warning(f"Warnings: {res['errors'][:3]}")
+                except Exception as exc:
+                    st.warning(f"ADOT Bid Tab sync failed: {exc}")
+
             e2c2_code = st.text_input("ADOT E2C2 Item Code", value="2030301")
             if st.button("Test ADOT E2C2 Query"):
                 try:
@@ -534,6 +548,16 @@ elif page == "Ingestion & Scrapers":
                     st.warning(f"Live E2C2 request failed (network/proxy or portal change): {exc}")
 
         with c_phx:
+            if st.button("Sync Phoenix OpenGov", type="primary"):
+                try:
+                    res_og = run_phoenix_opengov_sync(DB_PATH, limit=15)
+                    st.success(
+                        f"Discovered {res_og['discovered']} solicitations | "
+                        f"New: {res_og['ingested']} | Skipped: {res_og['skipped']}"
+                    )
+                except Exception as exc:
+                    st.warning(f"OpenGov sync failed: {exc}")
+
             if st.button("Fetch Phoenix OpenGov Solicitations"):
                 try:
                     sols = fetch_phoenix_opengov_solicitations(limit=10)
@@ -544,8 +568,8 @@ elif page == "Ingestion & Scrapers":
                     st.warning(f"Live OpenGov request failed: {exc}")
 
         with c_reset:
-            st.markdown("Reset SQLite database to the deterministic Arizona seed dataset.")
-            if st.button("Re-seed Demo Database"):
+            st.markdown("Reset SQLite database to the 210-project Arizona dataset.")
+            if st.button("Re-seed 210-Project Database"):
                 seed_database(DB_PATH, force=True)
-                st.success("Database re-seeded with Arizona ADOT + MAG dataset.")
+                st.success("Database re-seeded with 210 Arizona ADOT + MAG projects.")
                 st.rerun()

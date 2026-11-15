@@ -30,3 +30,37 @@ def test_opengov_csv_parse_and_ingest(tmp_path: Path):
     stats = get_overview_stats(db_path)
     assert stats["projects"] == 1
     assert stats["bid_lines"] == 2
+
+
+def test_adot_pdf_discovery_and_dry_run_sync(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.scrapers.adot import discover_adot_bid_tab_pdfs, run_adot_archive_sync
+
+    html = """
+    <html><body>
+      <a href="/files/bidtabs/F051201C_bidtab.pdf">TRACS F051201C - Loop 101 Widening</a>
+      <a href="https://azdot.gov/files/H890101C.pdf">H890101C - I-10 Corridor</a>
+      <a href="/about">About ADOT</a>
+    </body></html>
+    """
+    mock_resp = MagicMock()
+    mock_resp.text = html
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.return_value = mock_resp
+
+    links = discover_adot_bid_tab_pdfs(session=mock_sess)
+    assert len(links) == 2
+    assert links[0]["project_num"] == "F051201C"
+    assert links[0]["url"] == "https://azdot.gov/files/bidtabs/F051201C_bidtab.pdf"
+
+    db_path = tmp_path / "test_adot_sync.db"
+    init_db(db_path)
+    res = run_adot_archive_sync(db_path, dry_run=True, session=mock_sess)
+    assert res["discovered"] == 2
+    assert res["ingested"] == 2
+    assert res["skipped"] == 0
+
