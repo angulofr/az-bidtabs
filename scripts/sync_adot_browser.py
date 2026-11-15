@@ -149,17 +149,31 @@ def sync_adot_via_browser(
         print(f"Opening {url} (mode={mode}, headless={headless}) ...")
         nav_resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page_status = nav_resp.status if nav_resp else None
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
         page.wait_for_timeout(wait_seconds * 1000)
         page_title = page.title()
-        print(f"Loaded page: HTTP {page_status} | Title: {page_title!r}")
+        print(f"Loaded page: HTTP {page_status} | Title: {page_title!r} | Frames: {len(page.frames)}")
 
-        anchors = page.eval_on_selector_all(
-            "a[href]",
-            """els => els.map(e => ({
-                href: e.getAttribute('href') || '',
-                text: (e.innerText || '').trim()
-            }))""",
-        )
+        anchors: list[dict[str, str]] = []
+        frame_urls: list[str] = []
+        for frame in page.frames:
+            frame_urls.append(frame.url)
+            try:
+                frame_anchors = frame.eval_on_selector_all(
+                    "a[href]",
+                    """els => els.map(e => ({
+                        href: e.getAttribute('href') || '',
+                        text: (e.innerText || e.textContent || '').trim()
+                    }))""",
+                )
+                for a in frame_anchors:
+                    a["base_url"] = frame.url or url
+                anchors.extend(frame_anchors)
+            except Exception:
+                pass
 
         pdf_links: list[dict[str, str]] = []
         seen: set[str] = set()
@@ -167,7 +181,7 @@ def sync_adot_via_browser(
             href = a["href"].strip()
             if ".pdf" not in href.lower():
                 continue
-            full_url = urljoin(url, href)
+            full_url = urljoin(a.get("base_url") or url, href)
             if full_url in seen:
                 continue
             seen.add(full_url)
@@ -181,7 +195,15 @@ def sync_adot_via_browser(
                 break
 
         discovered = len(pdf_links)
-        print(f"Discovered {discovered} ADOT Bid Tab PDF links.")
+        print(f"Discovered {discovered} ADOT Bid Tab PDF links (scanned {len(anchors)} total anchors).")
+        if discovered == 0:
+            print(f"Frame URLs: {frame_urls}")
+            interesting = [
+                (a["text"][:60], a["href"][:120])
+                for a in anchors
+                if any(k in (a["text"] + a["href"]).lower() for k in ("bid", "tab", "pdf", "doc", "tracs", "2025", "2026", "result", "historical"))
+            ]
+            print(f"Sample matching anchors ({len(interesting)}): {interesting[:30]}")
 
         for item in pdf_links:
             proj_num = item["project_num"]
