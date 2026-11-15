@@ -192,6 +192,9 @@ if page == "Market Overview":
                     "winning_bid_total": st.column_config.NumberColumn(
                         "Winning Bid Total", format="$%,.0f"
                     ),
+                    "contractor_employees": st.column_config.NumberColumn(
+                        "Approx. Employees", format="%,d"
+                    ),
                 },
             )
 
@@ -333,6 +336,7 @@ elif page == "Pay Item Explorer":
         "description",
         "unit",
         "bidder_name",
+        "bidder_employees",
         "quantity",
         "unit_price",
         "extended_total",
@@ -344,6 +348,8 @@ elif page == "Pay Item Explorer":
         use_container_width=True,
         hide_index=True,
         column_config={
+            "bidder_name": "Bidder",
+            "bidder_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
             "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
             "unit_price": st.column_config.NumberColumn("Unit Price", format="$%,.2f"),
             "extended_total": st.column_config.NumberColumn("Extended Total", format="$%,.2f"),
@@ -369,6 +375,7 @@ elif page == "Competitor Intel & Head-to-Head":
             hide_index=True,
             column_config={
                 "contractor_name": "Contractor",
+                "approx_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
                 "az_roc_license": "AZ ROC License",
                 "total_bids": st.column_config.NumberColumn("Total Bids", format="%d"),
                 "wins": st.column_config.NumberColumn("Wins", format="%d"),
@@ -382,11 +389,26 @@ elif page == "Competitor Intel & Head-to-Head":
     st.divider()
     st.subheader("Head-to-Head Line-Item Comparison")
     contractor_names = scorecard["contractor_name"].tolist() if not scorecard.empty else []
+    emp_lookup = (
+        dict(zip(scorecard["contractor_name"], scorecard["approx_employees"]))
+        if not scorecard.empty
+        else {}
+    )
     if len(contractor_names) >= 2:
         ca, cb = st.columns(2)
-        contractor_a = ca.selectbox("Contractor A (Your Firm / Target)", contractor_names, index=0)
+        contractor_a = ca.selectbox(
+            "Contractor A (Your Firm / Target)",
+            contractor_names,
+            index=0,
+            format_func=lambda n: f"{n} (~{int(emp_lookup[n]):,} emp)" if pd.notna(emp_lookup.get(n)) else n,
+        )
         default_b_idx = 1 if len(contractor_names) > 1 else 0
-        contractor_b = cb.selectbox("Contractor B (Competitor)", contractor_names, index=default_b_idx)
+        contractor_b = cb.selectbox(
+            "Contractor B (Competitor)",
+            contractor_names,
+            index=default_b_idx,
+            format_func=lambda n: f"{n} (~{int(emp_lookup[n]):,} emp)" if pd.notna(emp_lookup.get(n)) else n,
+        )
 
         if contractor_a == contractor_b:
             st.warning("Select two different contractors for Head-to-Head comparison.")

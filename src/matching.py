@@ -238,4 +238,20 @@ def benchmark_schedule(
                 }
             )
 
-    return pd.DataFrame(results)
+    out_df = pd.DataFrame(results)
+    for col in [
+        "quantity",
+        "your_unit_price",
+        "your_extended",
+        "match_score",
+        "observations",
+        "hist_p25",
+        "hist_median",
+        "hist_p75",
+        "hist_qty_wtd",
+        "pct_vs_median",
+        "extended_vs_median",
+    ]:
+        if col in out_df.columns:
+            out_df[col] = pd.to_numeric(out_df[col], errors="coerce")
+    return out_df

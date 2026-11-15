@@ -16,22 +16,22 @@ from src.db import (
 )
 
 CONTRACTORS = [
-    ("Ames Construction, Inc.", "ROC123456"),
-    ("Pulice Construction, Inc.", "ROC109821"),
-    ("Fann Contracting, Inc.", "ROC087432"),
-    ("Fisher Sand & Gravel Co.", "ROC145678"),
-    ("Achen-Gardner Construction, LLC", "ROC198234"),
-    ("Sunland Asphalt & Construction, LLC", "ROC112233"),
-    ("Markham Contracting Co., Inc.", "ROC134567"),
-    ("Hunter Contracting Co.", "ROC095412"),
-    ("Banicki Construction, Inc.", "ROC167890"),
-    ("Combs Construction Company, Inc.", "ROC178901"),
-    ("Granite Construction Company", "ROC078123"),
-    ("Kiewit Infrastructure West Co.", "ROC065432"),
-    ("Rummel Construction, Inc.", "ROC154321"),
-    ("Buesing Corp.", "ROC187654"),
-    ("Dibble & Associates Contracting, LLC", "ROC201122"),
-    ("Cactus Asphalt / Cactus Transport, Inc.", "ROC142299"),
+    ("Ames Construction, Inc.", "ROC123456", 1200),
+    ("Pulice Construction, Inc.", "ROC109821", 450),
+    ("Fann Contracting, Inc.", "ROC087432", 320),
+    ("Fisher Sand & Gravel Co.", "ROC145678", 550),
+    ("Achen-Gardner Construction, LLC", "ROC198234", 280),
+    ("Sunland Asphalt & Construction, LLC", "ROC112233", 650),
+    ("Markham Contracting Co., Inc.", "ROC134567", 180),
+    ("Hunter Contracting Co.", "ROC095412", 260),
+    ("Banicki Construction, Inc.", "ROC167890", 140),
+    ("Combs Construction Company, Inc.", "ROC178901", 110),
+    ("Granite Construction Company", "ROC078123", 1800),
+    ("Kiewit Infrastructure West Co.", "ROC065432", 2500),
+    ("Rummel Construction, Inc.", "ROC154321", 380),
+    ("Buesing Corp.", "ROC187654", 220),
+    ("Dibble & Associates Contracting, LLC", "ROC201122", 75),
+    ("Cactus Asphalt / Cactus Transport, Inc.", "ROC142299", 190),
 ]
 
 # 44 authentic ADOT & MAG pay items
@@ -125,6 +125,9 @@ def seed_database(db_path: Path | str = DEFAULT_DB_PATH, *, force: bool = False)
     with db_session(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         if existing >= 100 and not force:
+            # Backfill approx_employees if migrating from an older schema
+            for name, roc, emp in CONTRACTORS:
+                upsert_contractor(conn, name, roc, emp)
             return False
 
         if force or existing > 0:
@@ -135,7 +138,9 @@ def seed_database(db_path: Path | str = DEFAULT_DB_PATH, *, force: bool = False)
 
         rng = random.Random(2026)
 
-        contractor_ids = [upsert_contractor(conn, name, roc) for name, roc in CONTRACTORS]
+        contractor_ids = [
+            upsert_contractor(conn, name, roc, emp) for name, roc, emp in CONTRACTORS
+        ]
         item_ids = [
             upsert_pay_item(conn, spec, code, desc, unit, cat)
             for spec, code, desc, unit, cat, _ in PAY_ITEMS

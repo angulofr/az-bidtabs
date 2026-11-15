@@ -25,7 +25,8 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS contractors (
     contractor_id INTEGER PRIMARY KEY AUTOINCREMENT,
     canonical_name TEXT NOT NULL UNIQUE,
-    az_roc_license TEXT
+    az_roc_license TEXT,
+    approx_employees INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -105,18 +106,23 @@ def db_session(db_path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connec
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
     with db_session(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        # Safe migration for existing SQLite databases
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(contractors)").fetchall()}
+        if "approx_employees" not in cols:
+            conn.execute("ALTER TABLE contractors ADD COLUMN approx_employees INTEGER")
 
 
 def upsert_contractor(
     conn: sqlite3.Connection,
     raw_name: str,
     az_roc_license: str | None = None,
+    approx_employees: int | None = None,
 ) -> int:
     canonical = normalize_contractor_name(raw_name)
     if not canonical:
         raise ValueError("Contractor name cannot be empty.")
     row = conn.execute(
-        "SELECT contractor_id, az_roc_license FROM contractors WHERE canonical_name = ?",
+        "SELECT contractor_id, az_roc_license, approx_employees FROM contractors WHERE canonical_name = ?",
         (canonical,),
     ).fetchone()
     if row:
@@ -125,10 +131,15 @@ def upsert_contractor(
                 "UPDATE contractors SET az_roc_license = ? WHERE contractor_id = ?",
                 (az_roc_license, row["contractor_id"]),
             )
+        if approx_employees is not None and row["approx_employees"] is None:
+            conn.execute(
+                "UPDATE contractors SET approx_employees = ? WHERE contractor_id = ?",
+                (int(approx_employees), row["contractor_id"]),
+            )
         return int(row["contractor_id"])
     cur = conn.execute(
-        "INSERT INTO contractors (canonical_name, az_roc_license) VALUES (?, ?)",
-        (canonical, az_roc_license),
+        "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
+        (canonical, az_roc_license, int(approx_employees) if approx_employees is not None else None),
     )
     return int(cur.lastrowid)
 
@@ -296,7 +307,8 @@ def get_overview_stats(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, Any]:
             """
             SELECT p.agency, p.agency_project_num, p.title, p.county, p.letting_date,
                    p.engineers_estimate, p.winning_bid_total,
-                   c.canonical_name AS awarded_contractor
+                   c.canonical_name AS awarded_contractor,
+                   c.approx_employees AS contractor_employees
             FROM projects p
             LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
             ORDER BY p.letting_date DESC
@@ -373,6 +385,7 @@ def query_pay_item_observations(
             p.county,
             p.letting_date,
             COALESCE(c.canonical_name, 'ENGINEER''S ESTIMATE') AS bidder_name,
+            c.approx_employees AS bidder_employees,
             bl.is_engineers_estimate,
             bl.quantity,
             bl.unit_price,
@@ -449,6 +462,7 @@ def get_contractor_scorecard(db_path: Path | str = DEFAULT_DB_PATH) -> pd.DataFr
                 bl.project_id,
                 bl.contractor_id,
                 c.canonical_name AS contractor_name,
+                c.approx_employees,
                 c.az_roc_license,
                 p.agency,
                 p.engineers_estimate,
@@ -464,6 +478,7 @@ def get_contractor_scorecard(db_path: Path | str = DEFAULT_DB_PATH) -> pd.DataFr
         SELECT
             contractor_id,
             contractor_name,
+            approx_employees,
             COALESCE(az_roc_license, '—') AS az_roc_license,
             COUNT(*) AS total_bids,
             SUM(is_winner) AS wins,
