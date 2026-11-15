@@ -734,6 +734,38 @@ def get_head_to_head(
         pids = [int(x) for x in proj_df["project_id"].tolist()]
         placeholders = ",".join("?" for _ in pids)
         line_sql = f"""
+            WITH a_lines AS (
+                SELECT
+                    bl.project_id,
+                    bl.item_id,
+                    bl.quantity,
+                    bl.unit_price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bl.project_id, bl.item_id, bl.quantity
+                        ORDER BY bl.bid_line_id
+                    ) AS rn
+                FROM bid_lines bl
+                JOIN contractors c ON bl.contractor_id = c.contractor_id
+                WHERE c.canonical_name = ?
+                  AND bl.is_engineers_estimate = 0
+                  AND bl.project_id IN ({placeholders})
+            ),
+            b_lines AS (
+                SELECT
+                    bl.project_id,
+                    bl.item_id,
+                    bl.quantity,
+                    bl.unit_price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bl.project_id, bl.item_id, bl.quantity
+                        ORDER BY bl.bid_line_id
+                    ) AS rn
+                FROM bid_lines bl
+                JOIN contractors c ON bl.contractor_id = c.contractor_id
+                WHERE c.canonical_name = ?
+                  AND bl.is_engineers_estimate = 0
+                  AND bl.project_id IN ({placeholders})
+            )
             SELECT
                 p.agency_project_num,
                 p.title AS project_title,
@@ -746,16 +778,19 @@ def get_head_to_head(
                 b.unit_price AS b_unit_price,
                 CAST(ROUND(CAST(100.0 * (a.unit_price - b.unit_price) / NULLIF(b.unit_price, 0) AS NUMERIC), 2) AS DOUBLE PRECISION) AS a_vs_b_pct,
                 CAST(ROUND(CAST((a.unit_price - b.unit_price) * a.quantity AS NUMERIC), 2) AS DOUBLE PRECISION) AS extended_diff
-            FROM bid_lines a
-            JOIN contractors ca ON a.contractor_id = ca.contractor_id AND ca.canonical_name = ?
-            JOIN bid_lines b ON a.project_id = b.project_id AND a.item_id = b.item_id
-            JOIN contractors cb ON b.contractor_id = cb.contractor_id AND cb.canonical_name = ?
+            FROM a_lines a
+            JOIN b_lines b
+              ON a.project_id = b.project_id
+             AND a.item_id = b.item_id
+             AND a.quantity = b.quantity
+             AND a.rn = b.rn
             JOIN projects p ON a.project_id = p.project_id
             JOIN pay_items pi ON a.item_id = pi.item_id
-            WHERE a.project_id IN ({placeholders})
-              AND a.is_engineers_estimate = 0
-              AND b.is_engineers_estimate = 0
             ORDER BY ABS((a.unit_price - b.unit_price) * a.quantity) DESC
         """
-        line_df = conn.query_df(line_sql, [contractor_a, contractor_b, *pids])
+        line_df = conn.query_df(line_sql, [contractor_a, *pids, contractor_b, *pids])
+        for col in ["quantity", "a_unit_price", "b_unit_price", "a_vs_b_pct", "extended_diff"]:
+            if col in line_df.columns:
+                line_df[col] = pd.to_numeric(line_df[col], errors="coerce")
         return proj_df, line_df
+

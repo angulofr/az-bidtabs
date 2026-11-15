@@ -28,7 +28,7 @@ ADOT_BID_TABS_URL = "https://azdot.gov/business/contracts-and-specifications/bid
 
 _MONEY_RE = re.compile(r"^\$?\s*([\d,]+\.\d{2,4})$")
 _ITEM_LINE_RE = re.compile(
-    r"^(\d{6,8}[A-Z]?)\s+(.+?)\s+(CU\.YD\.|CY|L\.FT\.|LF|L\.SUM|LS|TON|EACH|EA|SQ\.YD\.|SY|SQ\.FT\.|SF|HOUR|HR|GAL|ACRE|DAY|LB|F\.A\.)\s+([\d,]+(?:\.\d+)?)\s+\$?([\d,]+\.\d{2,4})\s+\$?([\d,]+\.\d{2})$",
+    r"^(\d{6,8}[A-Z]?)\s+(.+?)\s+(CU\.YD\.|CU\.FT\.|CY|CF|L\.FT\.-DAY|L\.FT\.|LF|L\.SUM|LS|TON|EACH-DAY|EACH/DAY|EACH|EA|SQ\.YD\.|SY|SQ\.FT\.|SF|HOUR|HR|M\.GAL\.|GAL|ACRE|DAY|MONTH|DOLLAR|LB\.?|F\.A\.)\s+([\d,]+(?:\.\d+)?)\s+\$?([\d,]+\.\d{2,4})\s+\$?([\d,]+\.\d{2})$",
     re.IGNORECASE,
 )
 
@@ -98,13 +98,14 @@ def _parse_adot_bid_results_format(
             parsed.awarded_contractor = m_p1_rank.group(2).strip()
 
     # Item & bid tab lines (Page 2+)
-    item_hdr_re = re.compile(r"^(\d{6,7}[A-Z]?)\s+([A-Z][A-Z0-9\.]{1,12})\s+(.+)$")
+    # ADOT units include CU.YD., L.FT., SQ.YD., L.SUM, EACH, EACH-DAY, EACH/DAY, L.FT.-DAY, M.GAL., LB., etc.
+    item_hdr_re = re.compile(r"^(\d{6,8}[A-Z]?)\s+([A-Z][A-Z0-9\.\-/]{0,15})\s+(.+)$")
     dept_est_re = re.compile(
         r"^(?:Bid\s*Rank\s+)?Department\s+Estimate\s+([\d,]+(?:\.\d+)?)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)",
         re.IGNORECASE,
     )
     bidder_re = re.compile(
-        r"^(\d{1,2})\s+([A-Z0-9].+?)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)(?:\s+(?:[+\-]?[\d,]+(?:\.\d+)?%|N/?A))?$"
+        r"^(\d{1,2})\s+([A-Z0-9(].+?)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)(?:\s+(?:[+\-]?\s*[\d,]+(?:\.\d+)?%|N/?A|-))?$"
     )
     skip_prefixes = (
         "PRINTED:",
@@ -115,7 +116,13 @@ def _parse_adot_bid_results_format(
         "MEASURE",
         "BID RANK",
         "UNIT OF",
+        "UNIT PRICE",
+        "QUANTITY",
+        "EXTENDED",
         "COMPARED TO",
+        "DEPT ESTIMATE",
+        "PROPOSAL",
+        "BID RESULTS",
         "WINNING BIDDER",
     )
 
@@ -124,6 +131,7 @@ def _parse_adot_bid_results_format(
     current_desc = ""
     current_qty = 0.0
     awaiting_dept_est = False
+    item_has_dept_est = False
 
     for line in all_text_lines:
         clean = re.sub(r"\s+", " ", line).strip()
@@ -135,26 +143,37 @@ def _parse_adot_bid_results_format(
                 continue
 
         m_est = dept_est_re.match(clean)
-        if m_est and current_code:
-            awaiting_dept_est = False
-            qty = _to_float(m_est.group(1))
-            up = _to_float(m_est.group(2))
-            ext = _to_float(m_est.group(3))
-            current_qty = qty
-            parsed.lines.append(
-                ParsedBidLine(
-                    item_code=current_code,
-                    description=current_desc,
-                    unit=current_unit,
-                    quantity=qty,
-                    unit_price=up,
-                    extended_total=ext,
-                    bidder_name="DEPARTMENT ESTIMATE",
-                    is_engineers_estimate=True,
-                    bid_rank=None,
-                    is_winner=False,
+        if m_est:
+            if item_has_dept_est:
+                # Defensive guard: a new Department Estimate appeared without a matched item header;
+                # reset state rather than attributing a subsequent item's bids to the previous item code.
+                current_code = ""
+                current_unit = ""
+                current_desc = ""
+                current_qty = 0.0
+                awaiting_dept_est = False
+                continue
+            if current_code:
+                awaiting_dept_est = False
+                item_has_dept_est = True
+                qty = _to_float(m_est.group(1))
+                up = _to_float(m_est.group(2))
+                ext = _to_float(m_est.group(3))
+                current_qty = qty
+                parsed.lines.append(
+                    ParsedBidLine(
+                        item_code=current_code,
+                        description=current_desc,
+                        unit=current_unit,
+                        quantity=qty,
+                        unit_price=up,
+                        extended_total=ext,
+                        bidder_name="DEPARTMENT ESTIMATE",
+                        is_engineers_estimate=True,
+                        bid_rank=None,
+                        is_winner=False,
+                    )
                 )
-            )
             continue
 
         m_item = item_hdr_re.match(clean)
@@ -164,6 +183,7 @@ def _parse_adot_bid_results_format(
             current_desc = m_item.group(3).strip()
             current_qty = 0.0
             awaiting_dept_est = True
+            item_has_dept_est = False
             continue
 
         m_bid = bidder_re.match(clean)
@@ -272,7 +292,7 @@ def parse_adot_bid_tab_pdf(
     letting_date = _parse_e2c2_date(date_match.group(1)) if date_match else ""
 
     county_match = (
-        re.search(r"located\s+in\s+([A-Za-z\s]+?)\s+County", full_text, re.IGNORECASE)
+        re.search(r"located\s+(?:in|within)\s+([A-Za-z\s,&]+?)\s+Count(?:y|ies)", full_text, re.IGNORECASE)
         or re.search(r"COUNTY\s*:?\s*([A-Za-z\s]+?)(?:\n|DISTRICT|$)", full_text, re.IGNORECASE)
     )
     county = county_match.group(1).strip().title() if county_match else ""
@@ -287,7 +307,7 @@ def parse_adot_bid_tab_pdf(
     route = route_match.group(1).strip() if route_match else ""
 
     desc_para_match = re.search(
-        r"(The\s+proposed\s+project\s+is\s+located\s+in\s+[^\.]+(?:\.[^\.]+)?)",
+        r"(The\s+(?:proposed\s+)?(?:project|work)\s+(?:is\s+located|consists)[^\.]+(?:\.[^\.]+)?)",
         re.sub(r"\s+", " ", full_text),
         re.IGNORECASE,
     )

@@ -183,5 +183,70 @@ def test_sync_adot_browser_tracs_helper():
     assert extract_tracs_from_text("Unrelated Document.pdf") is None
 
 
+def test_adot_pdf_parser_handles_hyphen_slash_units_and_prevents_leakage():
+    from src.scrapers.adot import ParsedProjectBidTab, _parse_adot_bid_results_format
 
+    lines = [
+        "BID RESULTS FOR 2025115",
+        "*** Bid Tabs for Proposal Pamphlet 2025115 ***",
+        "7015052 L.FT. OBLITERATE PAVEMENT MARKING (STRIPE)",
+        "Bid Rank Department Estimate 55,010.000 $0.450 $24,754.50",
+        "1 CONTRACTOR A INC $0.330 $18,153.30 -26.7%",
+        "2 CONTRACTOR B LLC $0.380 $20,903.80 -15.6%",
+        "7016030 EACH-DAY BARRICADE (TYPE 1, TYPE 2, VERT.PANEL, TUBULAR MARKER)",
+        "Bid Rank Department Estimate 47,710.000 $0.500 $23,855.00",
+        "1 CONTRACTOR A INC $0.350 $16,698.50 -30.0%",
+        "2 CONTRACTOR B LLC $25.000 $1,192,750.00 +4900.0%",
+        "7016067 EACH-DAY CHANGEABLE MESSAGE BOARD (CONTRACTOR FURNISHED)",
+        "Bid Rank Department Estimate 730.000 $50.000 $36,500.00",
+        "1 CONTRACTOR A INC $46.650 $34,054.50 -6.7%",
+        "2 CONTRACTOR B LLC $1,792.000 $1,308,160.00 +3484.0%",
+        "7016020 L.FT.-DAY TEMPORARY CONCRETE BARRIER (IN USE)",
+        "Bid Rank Department Estimate 1,000.000 $0.250 $250.00",
+        "1 CONTRACTOR A INC $0.200 $200.00 -20.0%",
+        "9240130 EACH/DAY MISCELLANEOUS WORK",
+        "Bid Rank Department Estimate 100.000 $15.000 $1,500.00",
+        "1 CONTRACTOR A INC $12.000 $1,200.00 -20.0%",
+        "6050002 LB. REINFORCING STEEL",
+        "Bid Rank Department Estimate 5,000.000 $2.000 $10,000.00",
+        "1 CONTRACTOR A INC $1.850 $9,250.00 -7.5%",
+        "2090005 M.GAL. FURNISH WATER",
+        "Bid Rank Department Estimate 250.000 $40.000 $10,000.00",
+        "1 CONTRACTOR A INC $35.000 $8,750.00 -12.5%",
+        "9240110 CU.FT. MISCELLANEOUS WORK",
+        "Bid Rank Department Estimate 40.000 $10.000 $400.00",
+        "1 CONTRACTOR A INC $9.000 $360.00 -10.0%",
+        # Simulate an unparseable item header before another Department Estimate: must NOT leak onto 9240110
+        "UNEXPECTED HEADER WITHOUT CODE",
+        "Bid Rank Department Estimate 999.000 $99.000 $98,901.00",
+        "1 CONTRACTOR A INC $88.000 $87,912.00 -11.1%",
+    ]
 
+    parsed = ParsedProjectBidTab(agency="ADOT", agency_project_num="2025115", title="Test 2025115")
+    ok = _parse_adot_bid_results_format(lines, parsed)
+    assert ok is True
+
+    by_code = {}
+    for ln in parsed.lines:
+        by_code.setdefault(ln.item_code, []).append(ln)
+
+    assert set(by_code.keys()) == {
+        "7015052",
+        "7016030",
+        "7016067",
+        "7016020",
+        "9240130",
+        "6050002",
+        "2090005",
+        "9240110",
+    }
+    # 7015052 must have ONLY its own 3 lines (EE + 2 bidders), none of the EACH-DAY items
+    assert len(by_code["7015052"]) == 3
+    assert by_code["7016030"][0].unit == "EACH-DAY"
+    assert by_code["7016067"][2].unit_price == 1792.00
+    assert by_code["7016020"][0].unit == "L.FT.-DAY"
+    assert by_code["9240130"][0].unit == "EACH-DAY"
+    assert by_code["6050002"][0].unit == "LB"
+    assert by_code["2090005"][0].unit == "M.GAL"
+    assert by_code["9240110"][0].unit == "CU.FT."
+    assert len(by_code["9240110"]) == 2
