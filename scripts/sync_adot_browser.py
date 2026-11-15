@@ -70,6 +70,105 @@ def _get_already_pdf_archived_adot_nums(db_target: Path | str | None) -> set[str
     return archived
 
 
+def _collect_pdf_links_from_frames(
+    page,
+    base_url: str,
+    *,
+    limit: int,
+    seen: set[str],
+) -> tuple[list[dict[str, str]], list[str], int]:
+    """Scan all frames on the current Playwright page for ADOT Bid Tab PDF links."""
+    anchors: list[dict[str, str]] = []
+    frame_urls: list[str] = []
+    for frame in page.frames:
+        frame_urls.append(frame.url)
+        try:
+            frame_anchors = frame.eval_on_selector_all(
+                "a[href]",
+                """els => els.map(e => {
+                    const row = e.closest('tr');
+                    const rowText = row ? (row.innerText || row.textContent || '') : '';
+                    return {
+                        href: e.getAttribute('href') || '',
+                        text: (e.innerText || e.textContent || '').trim(),
+                        rowText: rowText.replace(/\\s+/g, ' ').trim(),
+                        titleAttr: e.getAttribute('title') || e.getAttribute('aria-label') || ''
+                    };
+                })""",
+            )
+            for a in frame_anchors:
+                a["base_url"] = frame.url or base_url
+            anchors.extend(frame_anchors)
+        except Exception:
+            pass
+
+    new_links: list[dict[str, str]] = []
+    for a in anchors:
+        href = a["href"].strip()
+        full_url = urljoin(a.get("base_url") or base_url, href)
+        href_lower = full_url.lower()
+        is_s3_adot_doc = "azdotcloud-prod-s3-files/document/" in href_lower
+        is_pdf_href = ".pdf" in href_lower
+        if not (is_s3_adot_doc or is_pdf_href):
+            continue
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+
+        row_ctx = " ".join(
+            p for p in (a.get("text", ""), a.get("titleAttr", ""), a.get("rowText", "")) if p
+        ).strip()
+        combined = f"{row_ctx} {href}".lower()
+        if not is_s3_adot_doc and (
+            "bid" not in combined and "tab" not in combined and not extract_tracs_from_text(combined)
+        ):
+            continue
+
+        tracs = (
+            extract_tracs_from_text(f"{row_ctx} {href}")
+            or Path(href.split("?")[0]).stem[:24]
+        )
+        title = a.get("rowText") or a.get("text") or Path(href.split("?")[0]).stem
+        new_links.append({"url": full_url, "title": title[:160], "project_num": tracs})
+        if len(seen) >= limit:
+            break
+
+    return new_links, frame_urls, len(anchors)
+
+
+def _advance_tabulations_iframe_page(page) -> bool:
+    """Try advancing to the next page inside an ADOT tabulations iframe if pagination exists."""
+    for frame in page.frames:
+        if "tabulations" not in (frame.url or "").lower():
+            continue
+        try:
+            clicked = frame.evaluate(
+                """() => {
+                    const candidates = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"], li.next a, .pagination a, .pagination button'
+                    ));
+                    for (const el of candidates) {
+                        const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        const isNext = txt === 'next' || txt === '›' || txt === '»' || txt === 'next page' || txt.startsWith('next ');
+                        if (!isNext) continue;
+                        const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true'
+                            || (el.className || '').toLowerCase().includes('disabled')
+                            || (el.parentElement && (el.parentElement.className || '').toLowerCase().includes('disabled'));
+                        if (disabled) continue;
+                        el.click();
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def sync_adot_via_browser(
     *,
     db_target: Path | str | None = None,
@@ -83,6 +182,7 @@ def sync_adot_via_browser(
     proxy_username: str | None = None,
     proxy_password: str | None = None,
     dry_run: bool = False,
+    probe_urls: list[str] | None = None,
 ) -> dict[str, object]:
     """Open ADOT Bid Tabulations in Chromium (local or cloud CDP), download new PDFs, and ingest."""
     from playwright.sync_api import sync_playwright
@@ -106,6 +206,7 @@ def sync_adot_via_browser(
     page_title = ""
     mode = "cdp" if ws_endpoint else ("proxy" if proxy_server else "direct")
     errors: list[str] = []
+    probe_results: list[dict[str, object]] = []
 
     with sync_playwright() as pw:
         if ws_endpoint:
@@ -157,83 +258,68 @@ def sync_adot_via_browser(
         page_title = page.title()
         print(f"Loaded page: HTTP {page_status} | Title: {page_title!r} | Frames: {len(page.frames)}")
 
-        anchors: list[dict[str, str]] = []
-        frame_urls: list[str] = []
-        for frame in page.frames:
-            frame_urls.append(frame.url)
-            try:
-                frame_anchors = frame.eval_on_selector_all(
-                    "a[href]",
-                    """els => els.map(e => {
-                        const row = e.closest('tr');
-                        const rowText = row ? (row.innerText || row.textContent || '') : '';
-                        return {
-                            href: e.getAttribute('href') || '',
-                            text: (e.innerText || e.textContent || '').trim(),
-                            rowText: rowText.replace(/\\s+/g, ' ').trim(),
-                            titleAttr: e.getAttribute('title') || e.getAttribute('aria-label') || ''
-                        };
-                    })""",
-                )
-                for a in frame_anchors:
-                    a["base_url"] = frame.url or url
-                anchors.extend(frame_anchors)
-            except Exception:
-                pass
-
         pdf_links: list[dict[str, str]] = []
         seen: set[str] = set()
-        for a in anchors:
-            href = a["href"].strip()
-            full_url = urljoin(a.get("base_url") or url, href)
-            href_lower = full_url.lower()
-            is_s3_adot_doc = "azdotcloud-prod-s3-files/document/" in href_lower
-            is_pdf_href = ".pdf" in href_lower
-            if not (is_s3_adot_doc or is_pdf_href):
-                continue
-            if full_url in seen:
-                continue
-            seen.add(full_url)
+        frame_urls: list[str] = []
+        total_anchors = 0
 
-            row_ctx = " ".join(
-                p for p in (a.get("text", ""), a.get("titleAttr", ""), a.get("rowText", "")) if p
-            ).strip()
-            combined = f"{row_ctx} {href}".lower()
-            if not is_s3_adot_doc and (
-                "bid" not in combined and "tab" not in combined and not extract_tracs_from_text(combined)
-            ):
-                continue
-
-            tracs = (
-                extract_tracs_from_text(f"{row_ctx} {href}")
-                or Path(href.split("?")[0]).stem[:24]
+        for page_idx in range(10):
+            batch, frame_urls, anchor_count = _collect_pdf_links_from_frames(
+                page, url, limit=limit, seen=seen
             )
-            title = a.get("rowText") or a.get("text") or Path(href.split("?")[0]).stem
-            pdf_links.append({"url": full_url, "title": title[:160], "project_num": tracs})
-            if len(pdf_links) >= limit:
+            if page_idx == 0:
+                total_anchors = anchor_count
+            pdf_links.extend(batch)
+            if len(pdf_links) >= limit or not batch:
+                break
+            if not _advance_tabulations_iframe_page(page):
                 break
 
         discovered = len(pdf_links)
-        print(f"Discovered {discovered} ADOT Bid Tab PDF links (scanned {len(anchors)} total anchors).")
+        print(f"Discovered {discovered} ADOT Bid Tab PDF links (scanned {total_anchors} anchors on page 1).")
         if discovered == 0:
             print(f"Frame URLs: {frame_urls}")
         elif dry_run and pdf_links:
-            sample_item = pdf_links[0]
-            print(f"Sample discovered link[0]: project_num={sample_item['project_num']!r} title={sample_item['title']!r} url={sample_item['url']}")
-            try:
-                s_resp = context.request.get(sample_item["url"], timeout=60000)
-                s_bytes = s_resp.body() if s_resp.ok else b""
-                is_pdf = s_bytes.lstrip().startswith(b"%PDF")
-                print(f"Sample PDF fetch: HTTP {s_resp.status} | bytes={len(s_bytes)} | is_pdf={is_pdf}")
-                if is_pdf:
-                    s_parsed = parse_adot_bid_tab_pdf(s_bytes, filename=f"{sample_item['project_num']}.pdf")
-                    print(
-                        f"Sample PDF parsed: proj={s_parsed.agency_project_num!r} "
-                        f"date={s_parsed.letting_date!r} contractor={s_parsed.awarded_contractor!r} "
-                        f"lines={len(s_parsed.lines)}"
+            for idx, item in enumerate(pdf_links):
+                print(f"  [{idx}] {item['project_num']} | {item['title']}")
+            for idx, sample_item in enumerate(pdf_links[:3]):
+                try:
+                    s_resp = context.request.get(sample_item["url"], timeout=60000)
+                    s_bytes = s_resp.body() if s_resp.ok else b""
+                    is_pdf = s_bytes.lstrip().startswith(b"%PDF")
+                    if is_pdf:
+                        s_parsed = parse_adot_bid_tab_pdf(s_bytes, filename=f"{sample_item['project_num']}.pdf")
+                        print(
+                            f"Sample[{idx}] fetch: HTTP {s_resp.status} bytes={len(s_bytes)} | "
+                            f"parsed proj={s_parsed.agency_project_num!r} date={s_parsed.letting_date!r} "
+                            f"contractor={s_parsed.awarded_contractor!r} lines={len(s_parsed.lines)}"
+                        )
+                    else:
+                        print(f"Sample[{idx}] fetch: HTTP {s_resp.status} bytes={len(s_bytes)} is_pdf=False")
+                except Exception as exc:
+                    print(f"Sample[{idx}] dry-run check error: {exc}")
+
+        if probe_urls:
+            for p_url in probe_urls:
+                try:
+                    p_resp = page.goto(p_url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(4000)
+                    p_status = p_resp.status if p_resp else None
+                    p_title = page.title()
+                    p_links = page.eval_on_selector_all(
+                        "a[href*='/projects/']", "els => els.length"
                     )
-            except Exception as exc:
-                print(f"Sample PDF dry-run check error: {exc}")
+                    info = {
+                        "url": p_url,
+                        "status": p_status,
+                        "title": p_title,
+                        "project_links": p_links,
+                    }
+                    probe_results.append(info)
+                    print(f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | project_links={p_links}")
+                except Exception as exc:
+                    probe_results.append({"url": p_url, "error": str(exc)})
+                    print(f"Probe {p_url} failed: {exc}")
 
         for item in pdf_links:
             proj_num = item["project_num"]
@@ -277,7 +363,7 @@ def sync_adot_via_browser(
 
         browser.close()
 
-    return {
+    report: dict[str, object] = {
         "mode": mode,
         "page_status": page_status,
         "page_title": page_title,
@@ -287,6 +373,9 @@ def sync_adot_via_browser(
         "total_bid_lines": total_lines,
         "errors": errors,
     }
+    if probe_results:
+        report["probe_results"] = probe_results
+    return report
 
 
 def main() -> int:
@@ -299,6 +388,7 @@ def main() -> int:
     parser.add_argument("--ws-endpoint", type=str, default=None, help="Managed browser CDP WebSocket URL")
     parser.add_argument("--proxy", type=str, default=None, help="HTTP/SOCKS proxy URL")
     parser.add_argument("--dry-run", action="store_true", help="Discover PDFs without ingesting")
+    parser.add_argument("--probe-url", action="append", default=[], help="Extra URLs to probe in Playwright")
     args = parser.parse_args()
 
     report = sync_adot_via_browser(
@@ -310,6 +400,7 @@ def main() -> int:
         ws_endpoint=args.ws_endpoint,
         proxy_server=args.proxy,
         dry_run=args.dry_run,
+        probe_urls=args.probe_url or None,
     )
     print(json.dumps(report, indent=2))
     return 0

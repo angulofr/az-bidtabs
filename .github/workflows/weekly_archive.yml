@@ -67,10 +67,10 @@ jobs:
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: |
-          LIMIT="${{ github.event.inputs.limit || '25' }}"
+          LIMIT="${{ github.event.inputs.limit || '100' }}"
           EXTRA_FLAGS=""
           if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
-            EXTRA_FLAGS="--dry-run"
+            EXTRA_FLAGS="--dry-run --probe-url https://procurement.opengov.com/portal/phoenix --probe-url https://apps.azdot.gov/e2c2/HistoricalPrice.aspx"
           fi
           python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
 
