@@ -306,17 +306,40 @@ def sync_adot_via_browser(
                     page.wait_for_timeout(4000)
                     p_status = p_resp.status if p_resp else None
                     p_title = page.title()
-                    p_links = page.eval_on_selector_all(
-                        "a[href*='/projects/']", "els => els.length"
+                    summary = page.evaluate(
+                        """() => {
+                            const anchors = Array.from(document.querySelectorAll('a[href]')).map(e => ({
+                                href: e.getAttribute('href') || '',
+                                text: (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim()
+                            }));
+                            const docLinks = anchors.filter(a => {
+                                const h = a.href.toLowerCase();
+                                const t = a.text.toLowerCase();
+                                return h.includes('.pdf') || h.includes('.xlsx') || h.includes('.csv')
+                                    || t.includes('bid result') || t.includes('tabulation')
+                                    || h.includes('download') || h.includes('file') || h.includes('award');
+                            });
+                            return {
+                                total_anchors: anchors.length,
+                                table_rows: document.querySelectorAll('tr').length,
+                                doc_links_count: docLinks.length,
+                                sample_docs: docLinks.slice(0, 6)
+                            };
+                        }"""
                     )
                     info = {
                         "url": p_url,
                         "status": p_status,
                         "title": p_title,
-                        "project_links": p_links,
+                        **summary,
                     }
                     probe_results.append(info)
-                    print(f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | project_links={p_links}")
+                    print(
+                        f"Probe {p_url}: HTTP {p_status} | Title={p_title!r} | "
+                        f"rows={summary['table_rows']} doc_links={summary['doc_links_count']}"
+                    )
+                    for s in summary["sample_docs"]:
+                        print(f"    -> {s['text'][:60]!r} => {s['href'][:120]}")
                 except Exception as exc:
                     probe_results.append({"url": p_url, "error": str(exc)})
                     print(f"Probe {p_url} failed: {exc}")
