@@ -44,6 +44,16 @@ def import_folder(
     for fpath in files:
         ext = fpath.suffix.lower()
         try:
+            if ext == ".csv":
+                raw_bytes = fpath.read_bytes()
+                from src.scrapers.adot import ingest_e2c2_csv, is_e2c2_csv
+
+                if is_e2c2_csv(raw_bytes):
+                    res_e2c2 = ingest_e2c2_csv(raw_bytes, db_target)
+                    ingested += res_e2c2["projects"]
+                    total_lines += res_e2c2["bid_lines"]
+                    continue
+
             use_adot = source == "adot" or (source == "auto" and ext == ".pdf")
             if use_adot:
                 parsed = parse_adot_bid_tab_pdf(fpath)

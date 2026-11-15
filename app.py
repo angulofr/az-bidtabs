@@ -641,10 +641,33 @@ elif page == "Ingestion & Scrapers":
                 raw_bytes = f.read()
                 ext = Path(f.name).suffix.lower()
                 try:
-                    if ext == ".pdf":
+                    if ext == ".csv" and adot_scraper.is_e2c2_csv(raw_bytes):
+                        parsed_batch.append((f.name, ("E2C2", raw_bytes), None))
+                        preview_rows.append(
+                            {
+                                "Filename": f.name,
+                                "Agency": "ADOT (E2C2 Bulk)",
+                                "Project #": "MULTI-PROJECT",
+                                "Spec": "ADOT",
+                                "Parsed Lines": "Auto (All Rows)",
+                                "Status": "READY (E2C2)",
+                            }
+                        )
+                    elif ext == ".pdf":
                         parsed_item = adot_scraper.parse_adot_bid_tab_pdf(raw_bytes)
                         if parsed_item.agency_project_num == "ADOT-UNKNOWN":
                             parsed_item.agency_project_num = Path(f.name).stem[:32]
+                        parsed_batch.append((f.name, parsed_item, None))
+                        preview_rows.append(
+                            {
+                                "Filename": f.name,
+                                "Agency": parsed_item.agency,
+                                "Project #": parsed_item.agency_project_num,
+                                "Spec": parsed_item.spec_system,
+                                "Parsed Lines": len(parsed_item.lines),
+                                "Status": "READY" if parsed_item.lines else "NO LINES DETECTED",
+                            }
+                        )
                     else:
                         parsed_item = opengov_scraper.parse_opengov_bid_tab_export(
                             raw_bytes,
@@ -654,17 +677,17 @@ elif page == "Ingestion & Scrapers":
                             title=f"{batch_agency}: {Path(f.name).stem}",
                             county=batch_county,
                         )
-                    parsed_batch.append((f.name, parsed_item, None))
-                    preview_rows.append(
-                        {
-                            "Filename": f.name,
-                            "Agency": parsed_item.agency,
-                            "Project #": parsed_item.agency_project_num,
-                            "Spec": parsed_item.spec_system,
-                            "Parsed Lines": len(parsed_item.lines),
-                            "Status": "READY" if parsed_item.lines else "NO LINES DETECTED",
-                        }
-                    )
+                        parsed_batch.append((f.name, parsed_item, None))
+                        preview_rows.append(
+                            {
+                                "Filename": f.name,
+                                "Agency": parsed_item.agency,
+                                "Project #": parsed_item.agency_project_num,
+                                "Spec": parsed_item.spec_system,
+                                "Parsed Lines": len(parsed_item.lines),
+                                "Status": "READY" if parsed_item.lines else "NO LINES DETECTED",
+                            }
+                        )
                 except Exception as exc:
                     parsed_batch.append((f.name, None, str(exc)))
                     preview_rows.append(
@@ -680,7 +703,11 @@ elif page == "Ingestion & Scrapers":
 
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-            ready_items = [(n, p) for n, p, err in parsed_batch if p is not None and p.lines]
+            ready_items = [
+                (n, p)
+                for n, p, err in parsed_batch
+                if p is not None and (isinstance(p, tuple) or p.lines)
+            ]
             if ready_items and st.button(
                 f"Ingest {len(ready_items)} Valid File(s) into Database", type="primary"
             ):
@@ -690,9 +717,14 @@ elif page == "Ingestion & Scrapers":
                 errs = []
                 for idx, (fname, p_obj) in enumerate(ready_items, start=1):
                     try:
-                        adot_scraper.ingest_parsed_project(p_obj, DB_PATH)
-                        ingested_cnt += 1
-                        total_lines_cnt += len(p_obj.lines)
+                        if isinstance(p_obj, tuple) and p_obj[0] == "E2C2":
+                            res_e2c2 = adot_scraper.ingest_e2c2_csv(p_obj[1], DB_PATH)
+                            ingested_cnt += res_e2c2["projects"]
+                            total_lines_cnt += res_e2c2["bid_lines"]
+                        else:
+                            adot_scraper.ingest_parsed_project(p_obj, DB_PATH)
+                            ingested_cnt += 1
+                            total_lines_cnt += len(p_obj.lines)
                     except Exception as exc:
                         errs.append(f"{fname}: {exc}")
                     prog.progress(idx / len(ready_items))

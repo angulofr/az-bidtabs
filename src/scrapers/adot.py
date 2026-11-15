@@ -417,3 +417,185 @@ def run_adot_archive_sync(
         "errors": errors,
     }
 
+
+_DISTRICT_TO_COUNTY = {
+    "CENTRAL DISTRICT": "Maricopa",
+    "SOUTHCENT DISTRICT": "Pima",
+    "NORTHWEST DISTRICT": "Mohave",
+    "NORTHCENT DISTRICT": "Coconino",
+    "SOUTHWEST DISTRICT": "Yuma",
+    "NORTHEAST DISTRICT": "Navajo",
+    "SOUTHEAST DISTRICT": "Cochise",
+}
+
+
+def is_e2c2_csv(file_bytes: bytes) -> bool:
+    """Return True if CSV bytes look like an ADOT E2C2 SSRS Bid History export."""
+    head_text = file_bytes[:4096].decode("utf-8-sig", errors="ignore")
+    return "Tracs_Number" in head_text and "Item_Number" in head_text and "Bid_Date" in head_text
+
+
+def _parse_e2c2_float(val: Any) -> float:
+    if val is None:
+        return 0.0
+    s = str(val).strip().replace(",", "").replace("$", "")
+    if not s or s.lower() == "nan":
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_e2c2_date(val: Any) -> str:
+    s = str(val or "").strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        mm, dd, yyyy = m.groups()
+        return f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+    return s
+
+
+def ingest_e2c2_csv(
+    file_bytes: bytes,
+    db_path: Path | str | None = None,
+) -> dict[str, int]:
+    """Parse and batch-ingest an ADOT E2C2 Bid History CSV export into SQLite or Postgres."""
+    import pandas as pd
+
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    header_idx = 0
+    for i, line in enumerate(lines[:20]):
+        if "Tracs_Number" in line and "Item_Number" in line:
+            header_idx = i
+            break
+
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if df.empty:
+        return {"projects": 0, "pay_items": 0, "bid_lines": 0}
+
+    with db_session(db_path) as conn:
+        # Pre-create/lookup placeholder bidders for E2C2 anonymous rank columns
+        bidder_cids = {
+            1: upsert_contractor(conn, "ADOT LOW BIDDER (RANK 1)"),
+            2: upsert_contractor(conn, "ADOT BIDDER (RANK 2)"),
+            3: upsert_contractor(conn, "ADOT BIDDER (RANK 3)"),
+        }
+
+        # Cache existing pay items
+        item_cache: dict[tuple[str, str], int] = {
+            (r[1], r[2]): int(r[0])
+            for r in conn.execute(
+                "SELECT item_id, item_code, unit FROM pay_items WHERE spec_system = 'ADOT'"
+            ).fetchall()
+        }
+
+        # Group by Tracs_Number to compute project totals and upsert projects
+        df["Tracs_Number"] = df["Tracs_Number"].astype(str).str.strip()
+        project_ids: dict[str, int] = {}
+        new_items = 0
+        bid_line_rows: list[tuple[Any, ...]] = []
+
+        for tracs, grp in df.groupby("Tracs_Number", sort=False):
+            if not tracs or tracs.lower() == "nan":
+                continue
+            first = grp.iloc[0]
+            dist = str(first.get("DistName", "") or "").strip()
+            county = _DISTRICT_TO_COUNTY.get(dist.upper(), "")
+            bid_date = _parse_e2c2_date(first.get("Bid_Date", ""))
+            route = str(first.get("Route", "") or "").strip()
+            title = str(first.get("projname", "") or "").strip() or f"ADOT {tracs}"
+
+            ee_total = 0.0
+            win_total = 0.0
+            grp_rows: list[tuple[int, float, float, float, float, float]] = []
+
+            for _, r in grp.iterrows():
+                code = normalize_item_code(str(r.get("Item_Number", "")))
+                if not code:
+                    continue
+                desc = str(r.get("Description", "") or code).strip()
+                unit = normalize_unit(str(r.get("Measure", "EACH") or "EACH"))
+                qty = _parse_e2c2_float(r.get("Quantity"))
+                if qty <= 0:
+                    continue
+
+                key = (code, unit)
+                if key not in item_cache:
+                    item_cache[key] = upsert_pay_item(conn, "ADOT", code, desc, unit)
+                    new_items += 1
+                item_id = item_cache[key]
+
+                p_ee = _parse_e2c2_float(r.get("State"))
+                p_b1 = _parse_e2c2_float(r.get("Bidder_1"))
+                p_b2 = _parse_e2c2_float(r.get("Bidder_2"))
+                p_b3 = _parse_e2c2_float(r.get("Bidder_3"))
+
+                ee_total += qty * p_ee
+                win_total += qty * p_b1
+                grp_rows.append((item_id, qty, p_ee, p_b1, p_b2, p_b3))
+
+            if not grp_rows:
+                continue
+
+            pid = upsert_project(
+                conn,
+                agency="ADOT",
+                agency_project_num=tracs,
+                title=title,
+                route_or_location=route,
+                county=county or None,
+                district=dist or None,
+                letting_date=bid_date or None,
+                engineers_estimate=round(ee_total, 2),
+                winning_bid_total=round(win_total, 2),
+                awarded_contractor_id=bidder_cids[1] if win_total > 0 else None,
+                source_url=ADOT_E2C2_URL,
+            )
+            project_ids[tracs] = pid
+
+            # Clear prior lines for this project on re-import to avoid duplicates
+            conn.execute("DELETE FROM bid_lines WHERE project_id = ?", (pid,))
+
+            for item_id, qty, p_ee, p_b1, p_b2, p_b3 in grp_rows:
+                if p_ee > 0:
+                    bid_line_rows.append(
+                        (pid, None, 1, item_id, qty, p_ee, round(qty * p_ee, 2), None, 0)
+                    )
+                for rank, price in ((1, p_b1), (2, p_b2), (3, p_b3)):
+                    if price > 0:
+                        bid_line_rows.append(
+                            (
+                                pid,
+                                bidder_cids[rank],
+                                0,
+                                item_id,
+                                qty,
+                                price,
+                                round(qty * price, 2),
+                                rank,
+                                1 if rank == 1 else 0,
+                            )
+                        )
+
+        if bid_line_rows:
+            conn.executemany(
+                """
+                INSERT INTO bid_lines (
+                    project_id, contractor_id, is_engineers_estimate, item_id,
+                    quantity, unit_price, extended_total, bid_rank, is_winner
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                bid_line_rows,
+            )
+
+    return {
+        "projects": len(project_ids),
+        "pay_items": new_items,
+        "bid_lines": len(bid_line_rows),
+    }
+
+

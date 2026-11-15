@@ -90,3 +90,25 @@ def test_batch_import_folder(tmp_path: Path):
     assert get_overview_stats(db_path)["projects"] == 2
 
 
+def test_adot_e2c2_csv_ingest(tmp_path: Path):
+    from src.scrapers.adot import ingest_e2c2_csv, is_e2c2_csv
+
+    sample_e2c2 = (
+        '\ufefftextbox24,textbox22\n'
+        '"November 15, 2026","Parameter(s) supplied: Test"\n\n'
+        'DistName,Bid_Date,Item_Number,Description,Measure,Tracs_Number,Route,projname,length,Quantity,State,Bidder_1,Bidder_2,Bidder_3\n'
+        'CENTRAL DISTRICT,02/13/2026,2030301,ROADWAY EXCAVATION,CU.YD.,H687001C,303 MA 99.0,MC 85 - VAN BUREN ST,6.4,"115,421.00",20.00,12.80,12.00,.00\n'
+        'SOUTHCENT DISTRICT,02/06/2026,2020031,REMOVAL OF PCC PAVEMENT,SQ.YD.,F047501C,101 MA 0.0,SR101L & I-10,2.0,"76,347.00",20.00,19.25,16.55,.00\n'
+    ).encode("utf-8")
+
+    assert is_e2c2_csv(sample_e2c2) is True
+    db_path = tmp_path / "e2c2.db"
+    init_db(db_path)
+    res = ingest_e2c2_csv(sample_e2c2, db_path)
+    assert res["projects"] == 2
+    assert res["pay_items"] == 2
+    assert res["bid_lines"] == 6  # 2 projects * (EE + Bidder_1 + Bidder_2)
+    assert get_overview_stats(db_path)["projects"] == 2
+
+
+
