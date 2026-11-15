@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.db import DEFAULT_DB_PATH, init_db
+from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.phoenix_opengov import run_phoenix_opengov_sync
 
@@ -23,7 +23,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AZ BidTabs weekly archive sync")
     parser.add_argument("--limit", type=int, default=30, help="Max items per source")
     parser.add_argument("--dry-run", action="store_true", help="Discover without writing to DB")
-    parser.add_argument("--db", type=str, default=str(DEFAULT_DB_PATH), help="SQLite DB path")
+    parser.add_argument("--db", type=str, default=None, help="Optional DB path or Postgres URI (defaults to DATABASE_URL)")
     args = parser.parse_args()
 
     init_db(args.db)

@@ -9,7 +9,15 @@ on:
       limit:
         description: "Max items to check per source"
         required: false
-        default: "30"
+        default: "25"
+      mode:
+        description: "Sync method"
+        type: choice
+        default: "playwright"
+        options:
+          - playwright
+          - dry-run
+          - requests
 
 jobs:
   archive-bidtabs:
@@ -26,12 +34,54 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt pytest playwright
 
       - name: Run unit & integration tests
         run: pytest -v
 
-      - name: Run weekly ADOT & Phoenix OpenGov sync
+      - name: Install Chromium for Playwright
+        if: ${{ github.event.inputs.mode != 'requests' }}
         run: |
-          LIMIT="${{ github.event.inputs.limit || '30' }}"
-          python scripts/archive_weekly.py --limit "$LIMIT"
+          if [ -z "${{ secrets.BROWSER_WS_ENDPOINT }}" ]; then
+            playwright install chromium --with-deps
+          else
+            echo "BROWSER_WS_ENDPOINT is configured; skipping local Chromium install."
+          fi
+
+      - name: Verify DATABASE_URL secret is configured
+        if: ${{ github.event.inputs.mode != 'dry-run' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is missing. Add it in GitHub -> Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Run ADOT Cloud Browser Sync (Playwright / CDP / Proxy -> Neon)
+        if: ${{ github.event.inputs.mode != 'requests' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BROWSER_WS_ENDPOINT: ${{ secrets.BROWSER_WS_ENDPOINT }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '25' }}"
+          EXTRA_FLAGS=""
+          if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
+            EXTRA_FLAGS="--dry-run"
+          fi
+          python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
+
+      - name: Run Phoenix OpenGov & HTTP Sync
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '25' }}"
+          EXTRA_FLAGS=""
+          if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
+            EXTRA_FLAGS="--dry-run"
+          fi
+          python scripts/archive_weekly.py --limit "$LIMIT" $EXTRA_FLAGS
+

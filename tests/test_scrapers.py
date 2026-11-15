@@ -250,3 +250,50 @@ def test_adot_pdf_parser_handles_hyphen_slash_units_and_prevents_leakage():
     assert by_code["2090005"][0].unit == "M.GAL"
     assert by_code["9240110"][0].unit == "CU.FT."
     assert len(by_code["9240110"]) == 2
+
+
+def test_sync_adot_browser_upgrades_e2c2_only_projects(tmp_path: Path):
+    from scripts.sync_adot_browser import _get_already_pdf_archived_adot_nums
+    from src.db import init_db
+    from src.scrapers.adot import (
+        ParsedBidLine,
+        ParsedProjectBidTab,
+        ingest_e2c2_csv,
+        ingest_parsed_project,
+    )
+
+    db_path = tmp_path / "upgrade_e2c2.db"
+    init_db(db_path)
+
+    # 1. E2C2-only project (anonymous bidder) should NOT block PDF upgrade
+    e2c2_csv = (
+        "DistName,Bid_Date,Item_Number,Description,Measure,Tracs_Number,Route,projname,length,Quantity,State,Bidder_1,Bidder_2,Bidder_3\n"
+        "CENTRAL DISTRICT,02/13/2026,2030301,ROADWAY EXCAVATION,CU.YD.,H687001C,SR303,MC85,2.0,1000.0,20.0,15.0,16.0,0.0\n"
+    ).encode("utf-8")
+    ingest_e2c2_csv(e2c2_csv, db_path)
+    assert "H687001C" not in _get_already_pdf_archived_adot_nums(db_path)
+
+    # 2. Named PDF project SHOULD be marked archived and skipped in future syncs
+    parsed_pdf = ParsedProjectBidTab(
+        agency="ADOT",
+        agency_project_num="F069101C",
+        title="I-10 Cochise",
+        awarded_contractor="FNF CONSTRUCTION, INC.",
+        source_url="https://azdot.gov/business/contracts-and-specifications/bid-tabulations",
+        lines=[
+            ParsedBidLine(
+                item_code="2020009",
+                description="REMOVAL OF STRUCTURAL CONCRETE",
+                unit="CU.YD.",
+                quantity=1.0,
+                unit_price=30000.0,
+                extended_total=30000.0,
+                bidder_name="FNF CONSTRUCTION, INC.",
+                bid_rank=1,
+                is_winner=True,
+            )
+        ],
+    )
+    ingest_parsed_project(parsed_pdf, db_path)
+    assert "F069101C" in _get_already_pdf_archived_adot_nums(db_path)
+
