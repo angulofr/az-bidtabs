@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import sys
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import pandas as pd
 import plotly.express as px
@@ -20,18 +26,12 @@ from src.db import (
     query_pay_item_observations,
 )
 from src.matching import benchmark_schedule
-from src.scrapers.adot import (
-    ingest_parsed_project,
-    parse_adot_bid_tab_pdf,
-    run_adot_archive_sync,
-    scrape_adot_e2c2_historical,
-)
-from src.scrapers.phoenix_opengov import (
-    fetch_phoenix_opengov_solicitations,
-    parse_opengov_bid_tab_export,
-    run_phoenix_opengov_sync,
-)
+from src.scrapers import adot as adot_scraper
+from src.scrapers import phoenix_opengov as opengov_scraper
 from src.seed import seed_database
+
+importlib.reload(adot_scraper)
+importlib.reload(opengov_scraper)
 
 st.set_page_config(
     page_title="AZ BidTabs | Arizona Heavy-Civil Bid Intelligence",
@@ -490,7 +490,7 @@ elif page == "Ingestion & Scrapers":
         st.markdown("Upload an official ADOT Bid Tabulation PDF (`azdot.gov`) to parse and ingest into SQLite.")
         pdf_file = st.file_uploader("ADOT Bid Tab PDF", type=["pdf"])
         if pdf_file is not None:
-            parsed = parse_adot_bid_tab_pdf(pdf_file.read())
+            parsed = adot_scraper.parse_adot_bid_tab_pdf(pdf_file.read())
             st.write(
                 f"**Project:** `{parsed.agency_project_num}` — {parsed.title} | "
                 f"**County:** {parsed.county or '—'} | **Parsed Lines:** {len(parsed.lines)}"
@@ -498,7 +498,7 @@ elif page == "Ingestion & Scrapers":
             if parsed.lines:
                 st.dataframe(pd.DataFrame([vars(l) for l in parsed.lines]), use_container_width=True)
                 if st.button("Ingest Parsed ADOT Project into Database", type="primary"):
-                    pid = ingest_parsed_project(parsed, DB_PATH)
+                    pid = adot_scraper.ingest_parsed_project(parsed, DB_PATH)
                     st.success(f"Ingested ADOT project ID {pid} ({len(parsed.lines)} bid lines).")
             else:
                 st.warning("No structured pay item lines were detected in this PDF layout.")
@@ -509,7 +509,7 @@ elif page == "Ingestion & Scrapers":
         og_num = st.text_input("Project Number", value="PHX-2026-NEW")
         og_title = st.text_input("Project Title", value="City of Phoenix MAG Street Improvements")
         if og_file is not None:
-            parsed_og = parse_opengov_bid_tab_export(
+            parsed_og = opengov_scraper.parse_opengov_bid_tab_export(
                 og_file.read(),
                 og_file.name,
                 project_num=og_num,
@@ -519,7 +519,7 @@ elif page == "Ingestion & Scrapers":
             if parsed_og.lines:
                 st.dataframe(pd.DataFrame([vars(l) for l in parsed_og.lines]), use_container_width=True)
                 if st.button("Ingest MAG Project into Database", type="primary"):
-                    pid = ingest_parsed_project(parsed_og, DB_PATH)
+                    pid = adot_scraper.ingest_parsed_project(parsed_og, DB_PATH)
                     st.success(f"Ingested City of Phoenix project ID {pid}.")
 
     with tab_live:
@@ -527,7 +527,7 @@ elif page == "Ingestion & Scrapers":
         with c_e2c2:
             if st.button("Sync ADOT Bid Tab PDFs", type="primary"):
                 try:
-                    res = run_adot_archive_sync(DB_PATH, limit=15)
+                    res = adot_scraper.run_adot_archive_sync(DB_PATH, limit=15)
                     st.success(
                         f"Discovered {res['discovered']} PDFs | "
                         f"Ingested: {res['ingested']} | Skipped: {res['skipped']}"
@@ -540,7 +540,7 @@ elif page == "Ingestion & Scrapers":
             e2c2_code = st.text_input("ADOT E2C2 Item Code", value="2030301")
             if st.button("Test ADOT E2C2 Query"):
                 try:
-                    rows = scrape_adot_e2c2_historical(e2c2_code)
+                    rows = adot_scraper.scrape_adot_e2c2_historical(e2c2_code)
                     st.success(f"Fetched {len(rows)} E2C2 records.")
                     if rows:
                         st.dataframe(pd.DataFrame(rows[:25]), use_container_width=True)
@@ -550,7 +550,7 @@ elif page == "Ingestion & Scrapers":
         with c_phx:
             if st.button("Sync Phoenix OpenGov", type="primary"):
                 try:
-                    res_og = run_phoenix_opengov_sync(DB_PATH, limit=15)
+                    res_og = opengov_scraper.run_phoenix_opengov_sync(DB_PATH, limit=15)
                     st.success(
                         f"Discovered {res_og['discovered']} solicitations | "
                         f"New: {res_og['ingested']} | Skipped: {res_og['skipped']}"
@@ -560,7 +560,7 @@ elif page == "Ingestion & Scrapers":
 
             if st.button("Fetch Phoenix OpenGov Solicitations"):
                 try:
-                    sols = fetch_phoenix_opengov_solicitations(limit=10)
+                    sols = opengov_scraper.fetch_phoenix_opengov_solicitations(limit=10)
                     st.success(f"Fetched {len(sols)} solicitations.")
                     if sols:
                         st.dataframe(pd.DataFrame([vars(s) for s in sols]), use_container_width=True)
