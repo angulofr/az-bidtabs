@@ -148,9 +148,9 @@ def run_phoenix_opengov_sync(
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     """Fetch recent City of Phoenix OpenGov solicitations and record new projects."""
-    from src.db import DEFAULT_DB_PATH, db_session, upsert_project
+    from src.db import db_session, upsert_project
 
-    target_db = db_path or DEFAULT_DB_PATH
+    target_db = db_path
     solicitations = fetch_phoenix_opengov_solicitations(limit=limit, session=session)
 
     with db_session(target_db) as conn:

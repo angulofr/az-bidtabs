@@ -1,4 +1,4 @@
-"""SQLite database layer for AZ BidTabs (Postgres-ready schema)."""
+"""Dual-backend database layer for AZ BidTabs (Postgres via DATABASE_URL + SQLite fallback)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,39 @@ from src.normalize import (
 
 DEFAULT_DB_PATH = Path(os.environ.get("AZ_BIDTABS_DB", "data/az_bidtabs.db"))
 
-SCHEMA_SQL = """
+
+def get_database_url() -> str | None:
+    """Return Postgres DATABASE_URL from env var or Streamlit secrets if configured."""
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        import streamlit as st
+
+        secret_url = str(st.secrets.get("DATABASE_URL", "")).strip()
+        return secret_url or None
+    except Exception:
+        return None
+
+
+def is_postgres(db_target: Path | str | None = None) -> bool:
+    """Return True if the resolved target is a Postgres connection URI."""
+    if db_target is None:
+        url = get_database_url()
+        return bool(url and url.startswith(("postgres://", "postgresql://")))
+    if isinstance(db_target, str):
+        return db_target.startswith(("postgres://", "postgresql://"))
+    return False
+
+
+def _adapt_sql(sql: str, postgres: bool) -> str:
+    """Adapt SQLite-style `?` placeholders to `%s` for psycopg when running on Postgres."""
+    if not postgres:
+        return sql
+    return sql.replace("?", "%s")
+
+
+SQLITE_SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS contractors (
@@ -80,18 +112,150 @@ CREATE INDEX IF NOT EXISTS idx_bid_lines_item ON bid_lines(item_id);
 CREATE INDEX IF NOT EXISTS idx_bid_lines_contractor ON bid_lines(contractor_id);
 """
 
+POSTGRES_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS contractors (
+        contractor_id SERIAL PRIMARY KEY,
+        canonical_name TEXT NOT NULL UNIQUE,
+        az_roc_license TEXT,
+        approx_employees INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id SERIAL PRIMARY KEY,
+        agency TEXT NOT NULL,
+        agency_project_num TEXT NOT NULL,
+        title TEXT NOT NULL,
+        route_or_location TEXT,
+        county TEXT,
+        district TEXT,
+        letting_date TEXT,
+        award_date TEXT,
+        engineers_estimate DOUBLE PRECISION,
+        winning_bid_total DOUBLE PRECISION,
+        awarded_contractor_id INTEGER REFERENCES contractors(contractor_id),
+        source_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(agency, agency_project_num)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pay_items (
+        item_id SERIAL PRIMARY KEY,
+        spec_system TEXT NOT NULL CHECK (spec_system IN ('ADOT', 'MAG')),
+        item_code TEXT NOT NULL,
+        description TEXT NOT NULL,
+        unit TEXT NOT NULL,
+        category TEXT,
+        UNIQUE(spec_system, item_code, unit)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS bid_lines (
+        bid_line_id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        contractor_id INTEGER REFERENCES contractors(contractor_id),
+        is_engineers_estimate INTEGER NOT NULL DEFAULT 0 CHECK (is_engineers_estimate IN (0, 1)),
+        item_id INTEGER NOT NULL REFERENCES pay_items(item_id),
+        quantity DOUBLE PRECISION NOT NULL,
+        unit_price DOUBLE PRECISION NOT NULL,
+        extended_total DOUBLE PRECISION NOT NULL,
+        bid_rank INTEGER,
+        is_winner INTEGER NOT NULL DEFAULT 0 CHECK (is_winner IN (0, 1))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_projects_agency ON projects(agency)",
+    "CREATE INDEX IF NOT EXISTS idx_projects_county ON projects(county)",
+    "CREATE INDEX IF NOT EXISTS idx_projects_letting ON projects(letting_date)",
+    "CREATE INDEX IF NOT EXISTS idx_pay_items_code ON pay_items(item_code)",
+    "CREATE INDEX IF NOT EXISTS idx_pay_items_spec ON pay_items(spec_system)",
+    "CREATE INDEX IF NOT EXISTS idx_bid_lines_project ON bid_lines(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_bid_lines_item ON bid_lines(item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_bid_lines_contractor ON bid_lines(contractor_id)",
+    "ALTER TABLE contractors ADD COLUMN IF NOT EXISTS approx_employees INTEGER",
+]
 
-def get_connection(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    path = Path(db_path)
+
+class _DBConn:
+    """Thin unified wrapper around sqlite3.Connection and psycopg.Connection."""
+
+    def __init__(self, raw_conn: Any, postgres: bool) -> None:
+        self._conn = raw_conn
+        self.postgres = postgres
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
+        adapted = _adapt_sql(sql, self.postgres)
+        return self._conn.execute(adapted, params)
+
+    def executemany(self, sql: str, seq_of_params: list[tuple[Any, ...]]) -> Any:
+        adapted = _adapt_sql(sql, self.postgres)
+        if self.postgres:
+            with self._conn.cursor() as cur:
+                cur.executemany(adapted, seq_of_params)
+            return None
+        return self._conn.executemany(adapted, seq_of_params)
+
+    def insert_returning_id(
+        self, sql: str, params: tuple[Any, ...] | list[Any], pk_col: str
+    ) -> int:
+        if self.postgres:
+            row = self.execute(f"{sql.rstrip()} RETURNING {pk_col}", params).fetchone()
+            return int(row[0])
+        cur = self.execute(sql, params)
+        return int(cur.lastrowid)
+
+    def query_df(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> pd.DataFrame:
+        adapted = _adapt_sql(sql, self.postgres)
+        if self.postgres:
+            with self._conn.cursor() as cur:
+                cur.execute(adapted, params)
+                cols = [d.name for d in cur.description] if cur.description else []
+                rows = cur.fetchall()
+            return pd.DataFrame(rows, columns=cols)
+        cur = self._conn.execute(adapted, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = [tuple(r) for r in cur.fetchall()]
+        return pd.DataFrame(rows, columns=cols)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _resolve_target(db_path: Path | str | None) -> tuple[bool, Path | str]:
+    if db_path is None:
+        pg_url = get_database_url()
+        if pg_url:
+            return True, pg_url
+        return False, DEFAULT_DB_PATH
+    if isinstance(db_path, str) and db_path.startswith(("postgres://", "postgresql://")):
+        return True, db_path
+    return False, Path(db_path)
+
+
+def get_connection(db_path: Path | str | None = None) -> _DBConn:
+    use_pg, target = _resolve_target(db_path)
+    if use_pg:
+        import psycopg
+
+        raw = psycopg.connect(str(target))
+        return _DBConn(raw, postgres=True)
+    path = Path(target)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    raw = sqlite3.connect(str(path), check_same_thread=False)
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA foreign_keys = ON;")
+    return _DBConn(raw, postgres=False)
 
 
 @contextmanager
-def db_session(db_path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
+def db_session(db_path: Path | str | None = None) -> Iterator[_DBConn]:
     conn = get_connection(db_path)
     try:
         yield conn
@@ -103,17 +267,20 @@ def db_session(db_path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connec
         conn.close()
 
 
-def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
+def init_db(db_path: Path | str | None = None) -> None:
     with db_session(db_path) as conn:
-        conn.executescript(SCHEMA_SQL)
-        # Safe migration for existing SQLite databases
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(contractors)").fetchall()}
-        if "approx_employees" not in cols:
-            conn.execute("ALTER TABLE contractors ADD COLUMN approx_employees INTEGER")
+        if conn.postgres:
+            for stmt in POSTGRES_STATEMENTS:
+                conn.execute(stmt)
+        else:
+            conn._conn.executescript(SQLITE_SCHEMA_SQL)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(contractors)").fetchall()}
+            if "approx_employees" not in cols:
+                conn.execute("ALTER TABLE contractors ADD COLUMN approx_employees INTEGER")
 
 
 def upsert_contractor(
-    conn: sqlite3.Connection,
+    conn: _DBConn,
     raw_name: str,
     az_roc_license: str | None = None,
     approx_employees: int | None = None,
@@ -126,26 +293,27 @@ def upsert_contractor(
         (canonical,),
     ).fetchone()
     if row:
-        if az_roc_license and not row["az_roc_license"]:
+        cid, existing_roc, existing_emp = int(row[0]), row[1], row[2]
+        if az_roc_license and not existing_roc:
             conn.execute(
                 "UPDATE contractors SET az_roc_license = ? WHERE contractor_id = ?",
-                (az_roc_license, row["contractor_id"]),
+                (az_roc_license, cid),
             )
-        if approx_employees is not None and row["approx_employees"] is None:
+        if approx_employees is not None and existing_emp is None:
             conn.execute(
                 "UPDATE contractors SET approx_employees = ? WHERE contractor_id = ?",
-                (int(approx_employees), row["contractor_id"]),
+                (int(approx_employees), cid),
             )
-        return int(row["contractor_id"])
-    cur = conn.execute(
+        return cid
+    return conn.insert_returning_id(
         "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
         (canonical, az_roc_license, int(approx_employees) if approx_employees is not None else None),
+        "contractor_id",
     )
-    return int(cur.lastrowid)
 
 
 def upsert_pay_item(
-    conn: sqlite3.Connection,
+    conn: _DBConn,
     spec_system: str,
     item_code: str,
     description: str,
@@ -162,19 +330,19 @@ def upsert_pay_item(
         (spec, code, norm_unit),
     ).fetchone()
     if row:
-        return int(row["item_id"])
-    cur = conn.execute(
+        return int(row[0])
+    return conn.insert_returning_id(
         """
         INSERT INTO pay_items (spec_system, item_code, description, unit, category)
         VALUES (?, ?, ?, ?, ?)
         """,
         (spec, code, description.strip(), norm_unit, category),
+        "item_id",
     )
-    return int(cur.lastrowid)
 
 
 def upsert_project(
-    conn: sqlite3.Connection,
+    conn: _DBConn,
     *,
     agency: str,
     agency_project_num: str,
@@ -194,7 +362,7 @@ def upsert_project(
         (agency.strip(), agency_project_num.strip()),
     ).fetchone()
     if row:
-        pid = int(row["project_id"])
+        pid = int(row[0])
         conn.execute(
             """
             UPDATE projects
@@ -218,7 +386,7 @@ def upsert_project(
             ),
         )
         return pid
-    cur = conn.execute(
+    return conn.insert_returning_id(
         """
         INSERT INTO projects (
             agency, agency_project_num, title, route_or_location, county, district,
@@ -240,12 +408,12 @@ def upsert_project(
             awarded_contractor_id,
             source_url,
         ),
+        "project_id",
     )
-    return int(cur.lastrowid)
 
 
 def insert_bid_line(
-    conn: sqlite3.Connection,
+    conn: _DBConn,
     *,
     project_id: int,
     contractor_id: int | None,
@@ -258,7 +426,7 @@ def insert_bid_line(
     is_winner: bool = False,
 ) -> int:
     ext = extended_total if extended_total is not None else round(quantity * unit_price, 2)
-    cur = conn.execute(
+    return conn.insert_returning_id(
         """
         INSERT INTO bid_lines (
             project_id, contractor_id, is_engineers_estimate, item_id,
@@ -276,8 +444,8 @@ def insert_bid_line(
             bid_rank,
             1 if is_winner else 0,
         ),
+        "bid_line_id",
     )
-    return int(cur.lastrowid)
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +453,7 @@ def insert_bid_line(
 # ---------------------------------------------------------------------------
 
 
-def get_overview_stats(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, Any]:
+def get_overview_stats(db_path: Path | str | None = None) -> dict[str, Any]:
     with db_session(db_path) as conn:
         projects_cnt = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         contractors_cnt = conn.execute("SELECT COUNT(*) FROM contractors").fetchone()[0]
@@ -294,16 +462,15 @@ def get_overview_stats(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, Any]:
         total_awarded = (
             conn.execute("SELECT COALESCE(SUM(winning_bid_total), 0) FROM projects").fetchone()[0]
         )
-        agencies = pd.read_sql_query(
+        agencies = conn.query_df(
             """
             SELECT agency, COUNT(*) AS projects, COALESCE(SUM(winning_bid_total), 0) AS awarded_volume
             FROM projects
             GROUP BY agency
             ORDER BY projects DESC
-            """,
-            conn,
+            """
         )
-        recent_projects = pd.read_sql_query(
+        recent_projects = conn.query_df(
             """
             SELECT p.agency, p.agency_project_num, p.title, p.county, p.letting_date,
                    p.engineers_estimate, p.winning_bid_total,
@@ -313,8 +480,7 @@ def get_overview_stats(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, Any]:
             LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
             ORDER BY p.letting_date DESC
             LIMIT 15
-            """,
-            conn,
+            """
         )
     return {
         "projects": int(projects_cnt),
@@ -327,7 +493,7 @@ def get_overview_stats(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, Any]:
     }
 
 
-def get_filter_options(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, list[str]]:
+def get_filter_options(db_path: Path | str | None = None) -> dict[str, list[str]]:
     with db_session(db_path) as conn:
         agencies = [
             r[0]
@@ -360,7 +526,7 @@ def get_filter_options(db_path: Path | str = DEFAULT_DB_PATH) -> dict[str, list[
 
 
 def query_pay_item_observations(
-    db_path: Path | str = DEFAULT_DB_PATH,
+    db_path: Path | str | None = None,
     *,
     search_query: str = "",
     spec_system: str = "ALL",
@@ -402,7 +568,7 @@ def query_pay_item_observations(
 
     if search_query.strip():
         q = f"%{search_query.strip()}%"
-        sql += " AND (pi.item_code LIKE ? OR pi.description LIKE ?)"
+        sql += " AND (UPPER(pi.item_code) LIKE UPPER(?) OR UPPER(pi.description) LIKE UPPER(?))"
         params.extend([q, q])
 
     if spec_system in ("ADOT", "MAG"):
@@ -428,7 +594,7 @@ def query_pay_item_observations(
     sql += " ORDER BY p.letting_date DESC, pi.item_code, bl.bid_rank"
 
     with db_session(db_path) as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
+        df = conn.query_df(sql, params)
     return df
 
 
@@ -454,7 +620,7 @@ def compute_unit_price_stats(df: pd.DataFrame) -> dict[str, float | int]:
     }
 
 
-def get_contractor_scorecard(db_path: Path | str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def get_contractor_scorecard(db_path: Path | str | None = None) -> pd.DataFrame:
     """Compute contractor win-rate, avg % vs Engineer's Estimate, and bid volume."""
     sql = """
         WITH project_bids AS (
@@ -473,7 +639,7 @@ def get_contractor_scorecard(db_path: Path | str = DEFAULT_DB_PATH) -> pd.DataFr
             JOIN contractors c ON bl.contractor_id = c.contractor_id
             JOIN projects p ON bl.project_id = p.project_id
             WHERE bl.is_engineers_estimate = 0
-            GROUP BY bl.project_id, bl.contractor_id
+            GROUP BY bl.project_id, bl.contractor_id, c.canonical_name, c.approx_employees, c.az_roc_license, p.agency, p.engineers_estimate
         )
         SELECT
             contractor_id,
@@ -482,24 +648,28 @@ def get_contractor_scorecard(db_path: Path | str = DEFAULT_DB_PATH) -> pd.DataFr
             COALESCE(az_roc_license, '—') AS az_roc_license,
             COUNT(*) AS total_bids,
             SUM(is_winner) AS wins,
-            ROUND(100.0 * SUM(is_winner) / COUNT(*), 1) AS win_rate_pct,
-            ROUND(AVG(CASE WHEN engineers_estimate > 0
+            CAST(ROUND(CAST(100.0 * SUM(is_winner) / COUNT(*) AS NUMERIC), 1) AS DOUBLE PRECISION) AS win_rate_pct,
+            CAST(ROUND(CAST(AVG(CASE WHEN engineers_estimate > 0
                 THEN 100.0 * (bidder_total - engineers_estimate) / engineers_estimate
-                ELSE NULL END), 2) AS avg_pct_vs_ee,
-            ROUND(SUM(bidder_total), 2) AS total_bid_volume,
-            ROUND(SUM(CASE WHEN is_winner = 1 THEN bidder_total ELSE 0 END), 2) AS won_volume
+                ELSE NULL END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_pct_vs_ee,
+            CAST(ROUND(CAST(SUM(bidder_total) AS NUMERIC), 2) AS DOUBLE PRECISION) AS total_bid_volume,
+            CAST(ROUND(CAST(SUM(CASE WHEN is_winner = 1 THEN bidder_total ELSE 0 END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS won_volume
         FROM project_bids
-        GROUP BY contractor_id, contractor_name
+        GROUP BY contractor_id, contractor_name, approx_employees, az_roc_license
         ORDER BY wins DESC, total_bids DESC
     """
     with db_session(db_path) as conn:
-        return pd.read_sql_query(sql, conn)
+        df = conn.query_df(sql)
+    for col in ["total_bids", "wins", "win_rate_pct", "avg_pct_vs_ee", "total_bid_volume", "won_volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def get_head_to_head(
     contractor_a: str,
     contractor_b: str,
-    db_path: Path | str = DEFAULT_DB_PATH,
+    db_path: Path | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return (project_level_comparison_df, line_item_comparison_df) for two contractors."""
     with db_session(db_path) as conn:
@@ -528,20 +698,20 @@ def get_head_to_head(
                 a.bid_rank AS a_rank,
                 b.bid_total AS b_total,
                 b.bid_rank AS b_rank,
-                ROUND(100.0 * (a.bid_total - b.bid_total) / NULLIF(b.bid_total, 0), 2) AS a_vs_b_pct
+                CAST(ROUND(CAST(100.0 * (a.bid_total - b.bid_total) / NULLIF(b.bid_total, 0) AS NUMERIC), 2) AS DOUBLE PRECISION) AS a_vs_b_pct
             FROM projects p
             JOIN bids a ON p.project_id = a.project_id AND a.canonical_name = ?
             JOIN bids b ON p.project_id = b.project_id AND b.canonical_name = ?
             ORDER BY p.letting_date DESC
         """
-        proj_df = pd.read_sql_query(
-            proj_sql, conn, params=[contractor_a, contractor_b, contractor_a, contractor_b]
+        proj_df = conn.query_df(
+            proj_sql, [contractor_a, contractor_b, contractor_a, contractor_b]
         )
 
         if proj_df.empty:
             return proj_df, pd.DataFrame()
 
-        pids = proj_df["project_id"].tolist()
+        pids = [int(x) for x in proj_df["project_id"].tolist()]
         placeholders = ",".join("?" for _ in pids)
         line_sql = f"""
             SELECT
@@ -554,8 +724,8 @@ def get_head_to_head(
                 a.quantity,
                 a.unit_price AS a_unit_price,
                 b.unit_price AS b_unit_price,
-                ROUND(100.0 * (a.unit_price - b.unit_price) / NULLIF(b.unit_price, 0), 2) AS a_vs_b_pct,
-                ROUND((a.unit_price - b.unit_price) * a.quantity, 2) AS extended_diff
+                CAST(ROUND(CAST(100.0 * (a.unit_price - b.unit_price) / NULLIF(b.unit_price, 0) AS NUMERIC), 2) AS DOUBLE PRECISION) AS a_vs_b_pct,
+                CAST(ROUND(CAST((a.unit_price - b.unit_price) * a.quantity AS NUMERIC), 2) AS DOUBLE PRECISION) AS extended_diff
             FROM bid_lines a
             JOIN contractors ca ON a.contractor_id = ca.contractor_id AND ca.canonical_name = ?
             JOIN bid_lines b ON a.project_id = b.project_id AND a.item_id = b.item_id
@@ -567,5 +737,5 @@ def get_head_to_head(
               AND b.is_engineers_estimate = 0
             ORDER BY ABS((a.unit_price - b.unit_price) * a.quantity) DESC
         """
-        line_df = pd.read_sql_query(line_sql, conn, params=[contractor_a, contractor_b, *pids])
+        line_df = conn.query_df(line_sql, [contractor_a, contractor_b, *pids])
         return proj_df, line_df

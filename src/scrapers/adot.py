@@ -268,9 +268,9 @@ def scrape_adot_e2c2_historical(
 
 def ingest_parsed_project(
     parsed: ParsedProjectBidTab,
-    db_path: Path | str = DEFAULT_DB_PATH,
+    db_path: Path | str | None = None,
 ) -> int:
-    """Persist a ParsedProjectBidTab into SQLite."""
+    """Persist a ParsedProjectBidTab into SQLite or Postgres."""
     with db_session(db_path) as conn:
         awarded_cid = (
             upsert_contractor(conn, parsed.awarded_contractor)
@@ -363,14 +363,14 @@ def discover_adot_bid_tab_pdfs(
 
 
 def run_adot_archive_sync(
-    db_path: Path | str = DEFAULT_DB_PATH,
+    db_path: Path | str | None = None,
     *,
     limit: int = 25,
     dry_run: bool = False,
     timeout: int = 25,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Discover, download, parse, and archive ADOT bid tab PDFs not yet in SQLite."""
+    """Discover, download, parse, and archive ADOT bid tab PDFs not yet in the database."""
     sess = session or requests.Session()
     links = discover_adot_bid_tab_pdfs(limit=limit, timeout=timeout, session=sess)
 

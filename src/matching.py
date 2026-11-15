@@ -65,7 +65,7 @@ def load_item_benchmarks(
         {where_clause}
     """
     with db_session(db_path) as conn:
-        raw = pd.read_sql_query(sql, conn)
+        raw = conn.query_df(sql)
 
     if raw.empty:
         return pd.DataFrame(

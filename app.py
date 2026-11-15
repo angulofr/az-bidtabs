@@ -20,9 +20,12 @@ from src.db import (
     DEFAULT_DB_PATH,
     compute_unit_price_stats,
     get_contractor_scorecard,
+    get_database_url,
     get_filter_options,
     get_head_to_head,
     get_overview_stats,
+    init_db,
+    is_postgres,
     query_pay_item_observations,
 )
 from src.matching import benchmark_schedule
@@ -108,16 +111,49 @@ def check_access_gate() -> bool:
 if not check_access_gate():
     st.stop()
 
-# Ensure database is initialized & seeded on first run
-DB_PATH: Path = DEFAULT_DB_PATH
-seed_database(DB_PATH)
+def _get_config_flag(name: str) -> str:
+    val = os.environ.get(name, "").strip().lower()
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(name, "")).strip().lower()
+    except Exception:
+        return ""
+
+
+def is_production_mode() -> bool:
+    prod_flag = _get_config_flag("PRODUCTION_MODE")
+    if prod_flag in ("1", "true", "yes"):
+        return True
+    if prod_flag in ("0", "false", "no"):
+        return False
+    seed_demo = _get_config_flag("SEED_DEMO_DATA")
+    if seed_demo in ("1", "true", "yes"):
+        return False
+    return get_database_url() is not None
+
+
+# Resolve database target (Postgres DATABASE_URL if configured, else SQLite)
+DB_PATH: Path | str = get_database_url() or DEFAULT_DB_PATH
+PROD_MODE = is_production_mode()
+USING_POSTGRES = is_postgres(DB_PATH)
+
+if PROD_MODE:
+    init_db(DB_PATH)
+else:
+    seed_database(DB_PATH)
 
 # ---------------------------------------------------------------------------
 # Sidebar Navigation
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("## 🏗️ AZ BidTabs")
-    st.markdown('<span class="az-badge">ADOT + MAG SPEC</span>', unsafe_allow_html=True)
+    mode_label = "PRODUCTION" if PROD_MODE else "DEMO"
+    db_label = "POSTGRES" if USING_POSTGRES else "SQLITE"
+    st.markdown(
+        f'<span class="az-badge">{mode_label} • {db_label}</span>',
+        unsafe_allow_html=True,
+    )
     st.caption("Arizona Heavy-Civil Bid Intelligence")
     st.divider()
 
@@ -158,6 +194,12 @@ if page == "Market Overview":
     c2.metric("Contractors Tracked", f"{stats['contractors']:,}")
     c3.metric("Unique Pay Items", f"{stats['pay_items']:,}")
     c4.metric("Awarded Volume", f"${stats['total_awarded_volume'] / 1e6:,.1f}M")
+
+    if stats["projects"] == 0:
+        st.info(
+            "Database is empty (Production Mode). Go to **Ingestion & Scrapers → Batch Upload (Multi-File)** "
+            "to import ADOT Bid Tab PDFs or City of Phoenix / MCDOT CSV/XLSX exports."
+        )
 
     col_left, col_right = st.columns([1.2, 1.8])
     with col_left:
@@ -385,6 +427,8 @@ elif page == "Competitor Intel & Head-to-Head":
                 "won_volume": st.column_config.NumberColumn("Won Volume", format="$%,.0f"),
             },
         )
+    else:
+        st.info("No contractor bids recorded yet. Import bid tabulations in **Ingestion & Scrapers**.")
 
     st.divider()
     st.subheader("Head-to-Head Line-Item Comparison")
@@ -552,14 +596,115 @@ elif page == "Schedule Benchmarker":
 # ---------------------------------------------------------------------------
 elif page == "Ingestion & Scrapers":
     st.title("Data Ingestion & Scrapers")
-    st.caption("Ingest ADOT Bid Tabulation PDFs, City of Phoenix OpenGov exports, or run live portal checks.")
+    st.caption("Batch-ingest ADOT Bid Tabulation PDFs, Municipal/OpenGov CSV/XLSX exports, or run live portal checks.")
 
-    tab_pdf, tab_og, tab_live = st.tabs(
-        ["ADOT Bid Tab PDF Parser", "City of Phoenix OpenGov Import", "Live Scraper Checks & DB Admin"]
+    tab_batch, tab_pdf, tab_og, tab_live = st.tabs(
+        [
+            "Batch Upload (Multi-File)",
+            "Single ADOT PDF",
+            "Single OpenGov Export",
+            "Live Scraper Checks & DB Admin",
+        ]
     )
 
+    with tab_batch:
+        st.markdown(
+            "Drop **dozens of ADOT Bid Tab PDFs and/or OpenGov/MCDOT CSV/XLSX files** at once "
+            "to parse and persist them into your database."
+        )
+        b_col1, b_col2 = st.columns(2)
+        batch_agency = b_col1.selectbox(
+            "Default Agency (for CSV/XLSX files)",
+            [
+                "City of Phoenix",
+                "MCDOT",
+                "City of Mesa",
+                "City of Scottsdale",
+                "City of Chandler",
+                "City of Goodyear",
+                "Pima County",
+            ],
+        )
+        batch_county = b_col2.selectbox(
+            "Default County (for CSV/XLSX files)",
+            ["Maricopa", "Pima", "Pinal", "Yavapai", "Coconino"],
+        )
+        batch_files = st.file_uploader(
+            "Upload Multiple Bid Tab Files (PDF, CSV, XLSX, XLS)",
+            type=["pdf", "csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+        )
+        if batch_files:
+            parsed_batch = []
+            preview_rows = []
+            for f in batch_files:
+                raw_bytes = f.read()
+                ext = Path(f.name).suffix.lower()
+                try:
+                    if ext == ".pdf":
+                        parsed_item = adot_scraper.parse_adot_bid_tab_pdf(raw_bytes)
+                        if parsed_item.agency_project_num == "ADOT-UNKNOWN":
+                            parsed_item.agency_project_num = Path(f.name).stem[:32]
+                    else:
+                        parsed_item = opengov_scraper.parse_opengov_bid_tab_export(
+                            raw_bytes,
+                            f.name,
+                            agency=batch_agency,
+                            project_num=Path(f.name).stem[:32],
+                            title=f"{batch_agency}: {Path(f.name).stem}",
+                            county=batch_county,
+                        )
+                    parsed_batch.append((f.name, parsed_item, None))
+                    preview_rows.append(
+                        {
+                            "Filename": f.name,
+                            "Agency": parsed_item.agency,
+                            "Project #": parsed_item.agency_project_num,
+                            "Spec": parsed_item.spec_system,
+                            "Parsed Lines": len(parsed_item.lines),
+                            "Status": "READY" if parsed_item.lines else "NO LINES DETECTED",
+                        }
+                    )
+                except Exception as exc:
+                    parsed_batch.append((f.name, None, str(exc)))
+                    preview_rows.append(
+                        {
+                            "Filename": f.name,
+                            "Agency": "—",
+                            "Project #": "—",
+                            "Spec": "—",
+                            "Parsed Lines": 0,
+                            "Status": f"ERROR: {exc}",
+                        }
+                    )
+
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+            ready_items = [(n, p) for n, p, err in parsed_batch if p is not None and p.lines]
+            if ready_items and st.button(
+                f"Ingest {len(ready_items)} Valid File(s) into Database", type="primary"
+            ):
+                prog = st.progress(0.0)
+                ingested_cnt = 0
+                total_lines_cnt = 0
+                errs = []
+                for idx, (fname, p_obj) in enumerate(ready_items, start=1):
+                    try:
+                        adot_scraper.ingest_parsed_project(p_obj, DB_PATH)
+                        ingested_cnt += 1
+                        total_lines_cnt += len(p_obj.lines)
+                    except Exception as exc:
+                        errs.append(f"{fname}: {exc}")
+                    prog.progress(idx / len(ready_items))
+                st.success(
+                    f"Batch complete: Ingested **{ingested_cnt}** project(s) "
+                    f"and **{total_lines_cnt:,}** bid lines."
+                )
+                if errs:
+                    st.warning(f"Errors: {errs[:5]}")
+
     with tab_pdf:
-        st.markdown("Upload an official ADOT Bid Tabulation PDF (`azdot.gov`) to parse and ingest into SQLite.")
+        st.markdown("Upload an official ADOT Bid Tabulation PDF (`azdot.gov`) to parse and ingest.")
         pdf_file = st.file_uploader("ADOT Bid Tab PDF", type=["pdf"])
         if pdf_file is not None:
             parsed = adot_scraper.parse_adot_bid_tab_pdf(pdf_file.read())
@@ -640,8 +785,11 @@ elif page == "Ingestion & Scrapers":
                     st.warning(f"Live OpenGov request failed: {exc}")
 
         with c_reset:
-            st.markdown("Reset SQLite database to the 210-project Arizona dataset.")
-            if st.button("Re-seed 210-Project Database"):
-                seed_database(DB_PATH, force=True)
-                st.success("Database re-seeded with 210 Arizona ADOT + MAG projects.")
-                st.rerun()
+            if PROD_MODE:
+                st.info("Production Mode active: synthetic demo seeding is disabled.")
+            else:
+                st.markdown("Reset database to the 210-project Arizona demo dataset.")
+                if st.button("Re-seed 210-Project Database"):
+                    seed_database(DB_PATH, force=True)
+                    st.success("Database re-seeded with 210 Arizona ADOT + MAG projects.")
+                    st.rerun()

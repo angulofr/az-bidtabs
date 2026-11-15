@@ -64,3 +64,29 @@ def test_adot_pdf_discovery_and_dry_run_sync(tmp_path: Path):
     assert res["ingested"] == 2
     assert res["skipped"] == 0
 
+
+def test_batch_import_folder(tmp_path: Path):
+    from scripts.import_folder import import_folder
+
+    folder = tmp_path / "exports"
+    folder.mkdir()
+    (folder / "proj_a.csv").write_text(
+        "Item Code,Description,Unit,Quantity,Vendor,Unit Price\n"
+        "321-1,ASPHALT CONCRETE PAVEMENT,TON,1000,Ames Construction Inc,120.00\n",
+        encoding="utf-8",
+    )
+    (folder / "proj_b.csv").write_text(
+        "Item Code,Description,Unit,Quantity,Vendor,Unit Price\n"
+        "340-1,CONCRETE CURB AND GUTTER,LF,500,Pulice Construction Inc,34.50\n",
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "batch.db"
+    report = import_folder(folder, db_target=db_path, agency="City of Phoenix")
+    assert report["files_found"] == 2
+    assert report["ingested_projects"] == 2
+    assert report["total_bid_lines"] == 2
+    assert report["errors"] == []
+    assert get_overview_stats(db_path)["projects"] == 2
+
+

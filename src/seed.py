@@ -119,8 +119,8 @@ MAG_PROJECT_TYPES = [
 ]
 
 
-def seed_database(db_path: Path | str = DEFAULT_DB_PATH, *, force: bool = False) -> bool:
-    """Seed SQLite database with 210 realistic Arizona heavy-civil projects (2024–2026)."""
+def seed_database(db_path: Path | str | None = None, *, force: bool = False) -> bool:
+    """Seed database with 210 realistic Arizona heavy-civil projects (2024–2026)."""
     init_db(db_path)
     with db_session(db_path) as conn:
         existing = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]

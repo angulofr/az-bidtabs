@@ -43,3 +43,21 @@ def test_seed_and_analytics(tmp_path: Path):
     # Deterministic seed should have overlapping projects or at least return valid DataFrames
     assert proj_h2h is not None
     assert line_h2h is not None
+
+
+def test_postgres_helpers_and_empty_db(tmp_path: Path):
+    from src.db import _adapt_sql, init_db, is_postgres
+
+    assert is_postgres("postgresql://user:pass@localhost:5432/db") is True
+    assert is_postgres("postgres://user:pass@localhost:5432/db") is True
+    assert is_postgres(tmp_path / "local.db") is False
+    assert _adapt_sql("SELECT * FROM t WHERE a = ? AND b = ?", True) == "SELECT * FROM t WHERE a = %s AND b = %s"
+
+    empty_db = tmp_path / "empty.db"
+    init_db(empty_db)
+    ov = get_overview_stats(empty_db)
+    assert ov["projects"] == 0
+    assert ov["bid_lines"] == 0
+    assert get_contractor_scorecard(empty_db).empty
+    assert query_pay_item_observations(empty_db).empty
+
