@@ -124,9 +124,13 @@ class BonfireOpportunity:
     agency: str = ""
 
 
-def _is_civil_project(title: str) -> bool:
+def is_civil_project(title: str) -> bool:
     upper = (title or "").upper()
     return any(kw in upper for kw in _CIVIL_KEYWORDS)
+
+
+def _is_civil_project(title: str) -> bool:
+    return is_civil_project(title)
 
 
 def _get_portal_config(portal_key: str) -> BonfirePortalConfig:

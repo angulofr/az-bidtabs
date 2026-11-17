@@ -17,6 +17,8 @@ if str(ROOT) not in sys.path:
 from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.bonfire import run_all_bonfire_syncs
+from src.scrapers.maricopa_bidsync import run_maricopa_bidsync_sync
+from src.scrapers.mesa_chandler import run_chandler_sync, run_mesa_sync
 from src.scrapers.phoenix_opengov import run_phoenix_opengov_sync
 
 
@@ -32,6 +34,9 @@ def main() -> int:
         "adot": None,
         "phoenix_opengov": None,
         "bonfire": None,
+        "mcdot_bidsync": None,
+        "mesa": None,
+        "chandler": None,
     }
 
     try:
@@ -49,6 +54,23 @@ def main() -> int:
     report["bonfire"] = run_all_bonfire_syncs(
         args.db, limit=args.limit, dry_run=args.dry_run
     )
+
+    try:
+        report["mcdot_bidsync"] = run_maricopa_bidsync_sync(
+            args.db, limit=min(args.limit, 15), dry_run=args.dry_run
+        )
+    except Exception as exc:
+        report["mcdot_bidsync"] = {"error": str(exc)}
+
+    try:
+        report["mesa"] = run_mesa_sync(args.db, limit=args.limit, dry_run=args.dry_run)
+    except Exception as exc:
+        report["mesa"] = {"error": str(exc)}
+
+    try:
+        report["chandler"] = run_chandler_sync(args.db, limit=args.limit, dry_run=args.dry_run)
+    except Exception as exc:
+        report["chandler"] = {"error": str(exc)}
 
     print(json.dumps(report, indent=2))
     return 0

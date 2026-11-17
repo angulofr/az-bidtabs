@@ -578,3 +578,179 @@ def test_bonfire_multi_portal_goodyear_and_paradise_valley(tmp_path: Path):
     ]
 
 
+def test_maricopa_bidsync_parse_and_sync(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.maricopa_bidsync import (
+        BIDSYNC_MARICOPA_SEARCH_URL,
+        BIDSYNC_SEARCH_POST_URL,
+        run_maricopa_bidsync_sync,
+    )
+
+    search_get_html = """
+    <html><body>
+      <form id="elasticBidSearchForm">
+        <input type="hidden" name="javax.faces.ViewState" value="vs123" />
+        <input type="text" name="elasticBidSearchForm:bidSearchParametersComponent:j_idt323" value="" />
+      </form>
+    </body></html>
+    """
+    search_post_html = """
+    <html><body><table>
+      <tr>
+        <td>220014-DBB</td>
+        <td>Lower Buckeye Road - 71st Av to 67th Av</td>
+        <td>Maricopa County</td>
+        <td>Arizona</td>
+        <td>Oct 19, 2021 2:00:00 PM MST</td>
+        <td>Bid has ended</td>
+        <td><a href="https://www.bidsync.com/DPX?ac=awgrouplist&auc=2082474&supsrch=">Tab</a></td>
+      </tr>
+    </table></body></html>
+    """
+    tab_html = """
+    <html><body>
+      <table>
+        <tr><td>Awarded</td><td></td><td>Supplier</td><td></td></tr>
+        <tr>
+          <td><img alt="Awarded" /></td><td><img alt="Click to open supplier bid information" /></td>
+          <td></td><td>Nesbitt Contracting Co., Inc.</td>
+        </tr>
+        <tr><td></td><td>Default Lot</td><td>Unit Price</td><td>Qty</td><td>Price</td></tr>
+        <tr><td></td><td>220014-DBB--01-06 - Mobilization/Demobilization</td><td>$90,000.00</td><td>1</td><td>$90,000.00</td></tr>
+        <tr><td></td><td>220014-DBB--01-07 - Roadway Excavation</td><td>$30.00</td><td>7003</td><td>$210,090.00</td></tr>
+        <tr><td>TOTAL PRICE:</td><td>$300,090.00</td></tr>
+        <tr>
+          <td><img alt="Click to open supplier bid information" /></td>
+          <td></td><td></td><td>Combs Construction Company, Inc.</td>
+        </tr>
+        <tr><td></td><td>Default Lot</td><td>Unit Price</td><td>Qty</td><td>Price</td></tr>
+        <tr><td></td><td>220014-DBB--01-06 - Mobilization/Demobilization</td><td>$95,000.00</td><td>1</td><td>$95,000.00</td></tr>
+        <tr><td></td><td>220014-DBB--01-07 - Roadway Excavation</td><td>$32.00</td><td>7003</td><td>$224,096.00</td></tr>
+        <tr><td>TOTAL PRICE:</td><td>$319,096.00</td></tr>
+      </table>
+    </body></html>
+    """
+
+    get_resp = MagicMock(ok=True, text=search_get_html, url=BIDSYNC_MARICOPA_SEARCH_URL)
+    get_resp.raise_for_status = MagicMock()
+    post_resp = MagicMock(ok=True, text=search_post_html, url=BIDSYNC_SEARCH_POST_URL)
+    post_resp.raise_for_status = MagicMock()
+    tab_resp = MagicMock(
+        ok=True,
+        text=tab_html,
+        url="https://www.bidsync.com/DPX?ac=awgroupreview&auc=2082474&supsrch=&expandall=Y",
+    )
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.side_effect = lambda url, **kw: (
+        get_resp if url == BIDSYNC_MARICOPA_SEARCH_URL else tab_resp
+    )
+    mock_sess.post.return_value = post_resp
+
+    db_path = tmp_path / "mcdot_bidsync.db"
+    init_db(db_path)
+    res = run_maricopa_bidsync_sync(db_path, limit=5, session=mock_sess)
+    assert res["ingested"] == 1
+    assert res["total_bid_lines"] == 4
+
+    with db_session(db_path) as conn:
+        proj = conn.execute(
+            "SELECT agency, agency_project_num, letting_date, winning_bid_total FROM projects"
+        ).fetchone()
+        lines = conn.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN is_winner = 1 THEN 1 ELSE 0 END) FROM bid_lines"
+        ).fetchone()
+    assert tuple(proj) == ("MCDOT", "220014-DBB", "2021-10-19", 300090.0)
+    assert tuple(lines) == (4, 2)
+
+
+def test_mesa_and_chandler_metadata_sync(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.mesa_chandler import (
+        APP_AZ_BROWSE_URL,
+        MESA_SOCRATA_URL,
+        run_chandler_sync,
+        run_mesa_sync,
+    )
+
+    mesa_resp = MagicMock(ok=True)
+    mesa_resp.raise_for_status = MagicMock()
+    mesa_resp.json.return_value = [
+        {
+            "contract_no": "2027062",
+            "contract_description": "Streetlight Maint., Installations, Removals",
+            "contract_status": "Initiated",
+            "creation_date": "2026-10-28T00:00:00.000",
+        },
+        {
+            "contract_no": "2027066",
+            "contract_description": "Bee and Other Stinging Insect Removal Services",
+            "contract_status": "Initiated",
+            "creation_date": "2026-10-28T00:00:00.000",
+        },
+    ]
+
+    app_get_html = """
+    <html><body><form>
+      <input type="hidden" name="__VIEWSTATE" value="abc" />
+      <input type="hidden" name="body:x:selOrgaLevelOrgaNode_78E9FF04_1" value="" />
+    </form></body></html>
+    """
+    app_post_html = """
+    <html><body><table id="body_x_grid_grd">
+      <tr>
+        <td><a href="/page.aspx/en/bpm/process_manage_extranet/991">Edit</a></td>
+        <td>BPM007852</td>
+        <td>Invitation to Bid - City of Chandler Runway 4 Improvements</td>
+        <td>10/28/2026 8:00:00 AM</td>
+        <td>Heavy construction services</td>
+        <td>City of Chandler</td>
+        <td></td>
+        <td>Open for Bidding</td>
+      </tr>
+      <tr>
+        <td></td>
+        <td>BPM007818</td>
+        <td>Debt collection services</td>
+        <td>10/02/2026 1:45:00 PM</td>
+        <td>Debt collection services</td>
+        <td>City of Chandler</td>
+        <td></td>
+        <td>Achieved</td>
+      </tr>
+    </table></body></html>
+    """
+    app_get_resp = MagicMock(ok=True, text=app_get_html)
+    app_get_resp.raise_for_status = MagicMock()
+    app_post_resp = MagicMock(ok=True, text=app_post_html)
+    app_post_resp.raise_for_status = MagicMock()
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.side_effect = lambda url, **kw: (
+        mesa_resp if url == MESA_SOCRATA_URL else app_get_resp
+    )
+    mock_sess.post.return_value = app_post_resp
+
+    db_path = tmp_path / "mesa_chandler.db"
+    init_db(db_path)
+    res_m = run_mesa_sync(db_path, limit=10, session=mock_sess)
+    res_c = run_chandler_sync(db_path, limit=10, session=mock_sess)
+    assert res_m == {"agency": "City of Mesa", "discovered": 1, "ingested": 1, "skipped": 0}
+    assert res_c == {"agency": "City of Chandler", "discovered": 1, "ingested": 1, "skipped": 0}
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT agency, agency_project_num, letting_date FROM projects ORDER BY agency"
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("City of Chandler", "BPM007852", "2026-10-28"),
+        ("City of Mesa", "2027062", "2026-10-28"),
+    ]
+
+

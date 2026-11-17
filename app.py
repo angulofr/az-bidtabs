@@ -33,11 +33,15 @@ from src.db import (
 from src.matching import benchmark_schedule
 from src.scrapers import adot as adot_scraper
 from src.scrapers import bonfire as bonfire_scraper
+from src.scrapers import maricopa_bidsync as mcdot_scraper
+from src.scrapers import mesa_chandler as mesa_chandler_scraper
 from src.scrapers import phoenix_opengov as opengov_scraper
 from src.seed import seed_database
 
 importlib.reload(adot_scraper)
 importlib.reload(bonfire_scraper)
+importlib.reload(mcdot_scraper)
+importlib.reload(mesa_chandler_scraper)
 importlib.reload(opengov_scraper)
 
 st.set_page_config(
@@ -1118,6 +1122,27 @@ elif page == "Ingestion & Scrapers":
                         st.dataframe(pd.DataFrame([vars(o) for o in opps]), use_container_width=True)
                 except Exception as exc:
                     st.warning(f"Live Bonfire request failed: {exc}")
+
+            if st.button("Sync MCDOT BidSync (Line Items)", type="primary"):
+                try:
+                    res_mc = mcdot_scraper.run_maricopa_bidsync_sync(DB_PATH, limit=10)
+                    st.success(
+                        f"MCDOT: +{res_mc['ingested']}/{res_mc['discovered']} projects "
+                        f"({res_mc['total_bid_lines']} bid lines)"
+                    )
+                except Exception as exc:
+                    st.warning(f"MCDOT BidSync failed: {exc}")
+
+            if st.button("Sync Mesa & Chandler"):
+                try:
+                    res_mesa = mesa_chandler_scraper.run_mesa_sync(DB_PATH, limit=25)
+                    res_ch = mesa_chandler_scraper.run_chandler_sync(DB_PATH, limit=25)
+                    st.success(
+                        f"Mesa: +{res_mesa['ingested']}/{res_mesa['discovered']} | "
+                        f"Chandler: +{res_ch['ingested']}/{res_ch['discovered']}"
+                    )
+                except Exception as exc:
+                    st.warning(f"Mesa/Chandler sync failed: {exc}")
 
         with c_reset:
             if PROD_MODE:
