@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.phoenix_opengov import run_phoenix_opengov_sync
+from src.scrapers.scottsdale_bonfire import run_scottsdale_bonfire_sync
 
 
 def main() -> int:
@@ -27,7 +28,11 @@ def main() -> int:
     args = parser.parse_args()
 
     init_db(args.db)
-    report: dict[str, object] = {"adot": None, "phoenix_opengov": None}
+    report: dict[str, object] = {
+        "adot": None,
+        "phoenix_opengov": None,
+        "scottsdale_bonfire": None,
+    }
 
     try:
         report["adot"] = run_adot_archive_sync(args.db, limit=args.limit, dry_run=args.dry_run)
@@ -40,6 +45,13 @@ def main() -> int:
         )
     except Exception as exc:
         report["phoenix_opengov"] = {"error": str(exc)}
+
+    try:
+        report["scottsdale_bonfire"] = run_scottsdale_bonfire_sync(
+            args.db, limit=args.limit, dry_run=args.dry_run
+        )
+    except Exception as exc:
+        report["scottsdale_bonfire"] = {"error": str(exc)}
 
     print(json.dumps(report, indent=2))
     return 0

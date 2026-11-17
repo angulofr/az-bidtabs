@@ -15,6 +15,8 @@ from src.scrapers.adot import ParsedBidLine, ParsedProjectBidTab
 
 PHOENIX_OPENGOV_PORTAL = "https://procurement.opengov.com/portal/phoenix"
 PHOENIX_OPENGOV_API = "https://procurement.opengov.com/api/v1/portals/phoenix/projects"
+PHOENIX_LEGACY_PORTAL = "https://solicitations.phoenix.gov/"
+PHOENIX_LEGACY_AWARDS_URL = "https://solicitations.phoenix.gov/Awards"
 
 
 @dataclass
@@ -26,13 +28,74 @@ class OpenGovSolicitation:
     url: str
 
 
+def _is_cloudflare_challenge(html: str) -> bool:
+    lower = (html or "").lower()
+    return "challenges.cloudflare.com" in lower or "<title>just a moment...</title>" in lower
+
+
+def fetch_phoenix_legacy_solicitations(
+    limit: int = 25,
+    *,
+    timeout: int = 20,
+    session: requests.Session | None = None,
+) -> list[OpenGovSolicitation]:
+    """Fetch solicitation/award rows from City of Phoenix's legacy solicitations portal."""
+    sess = session or requests.Session()
+    sess.headers.update(
+        {"User-Agent": "AZ-BidTabs/1.0 (+https://azbidtabs.example; heavy-civil-intel)"}
+    )
+
+    solicitations: list[OpenGovSolicitation] = []
+    seen_nums: set[str] = set()
+    max_pages = 2 if limit > 25 else 1
+
+    for page_num in range(1, max_pages + 1):
+        url = (
+            PHOENIX_LEGACY_PORTAL
+            if page_num == 1
+            else f"{PHOENIX_LEGACY_AWARDS_URL}?page={page_num}&pageSize=25"
+        )
+        resp = sess.get(url, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for tr in soup.select("table tr"):
+            link = tr.select_one("a[href*='/Solicitations/Details/']")
+            if not link:
+                continue
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if len(cells) < 4:
+                continue
+            proj_num = cells[0].strip()
+            if not proj_num or proj_num in seen_nums:
+                continue
+            seen_nums.add(proj_num)
+            href = str(link.get("href") or "")
+            full_url = (
+                href if href.startswith("http") else f"https://solicitations.phoenix.gov{href}"
+            )
+            solicitations.append(
+                OpenGovSolicitation(
+                    project_num=proj_num,
+                    title=cells[1].strip(),
+                    status=cells[3].strip(),
+                    due_date="",
+                    url=full_url,
+                )
+            )
+            if len(solicitations) >= limit:
+                return solicitations
+
+    return solicitations
+
+
 def fetch_phoenix_opengov_solicitations(
     limit: int = 25,
     *,
     timeout: int = 20,
     session: requests.Session | None = None,
 ) -> list[OpenGovSolicitation]:
-    """Fetch recent solicitations from City of Phoenix OpenGov Procurement portal."""
+    """Fetch recent solicitations from City of Phoenix OpenGov or legacy awards fallback."""
     sess = session or requests.Session()
     sess.headers.update(
         {"User-Agent": "AZ-BidTabs/1.0 (+https://azbidtabs.example; heavy-civil-intel)"}
@@ -58,24 +121,30 @@ def fetch_phoenix_opengov_solicitations(
     except requests.RequestException:
         pass
 
-    # HTML fallback
-    resp = sess.get(PHOENIX_OPENGOV_PORTAL, timeout=timeout)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for card in soup.select("a[href*='/projects/']")[:limit]:
-        href = card.get("href", "")
-        text = card.get_text(" ", strip=True)
-        if text:
-            solicitations.append(
-                OpenGovSolicitation(
-                    project_num=href.rstrip("/").split("/")[-1],
-                    title=text,
-                    status="POSTED",
-                    due_date="",
-                    url=href if href.startswith("http") else f"https://procurement.opengov.com{href}",
-                )
-            )
-    return solicitations
+    # HTML fallback on OpenGov portal (skip if Cloudflare-gated)
+    try:
+        resp = sess.get(PHOENIX_OPENGOV_PORTAL, timeout=timeout)
+        if resp.ok and not _is_cloudflare_challenge(resp.text):
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for card in soup.select("a[href*='/projects/']")[:limit]:
+                href = str(card.get("href", ""))
+                text = card.get_text(" ", strip=True)
+                if text:
+                    solicitations.append(
+                        OpenGovSolicitation(
+                            project_num=href.rstrip("/").split("/")[-1],
+                            title=text,
+                            status="POSTED",
+                            due_date="",
+                            url=href if href.startswith("http") else f"https://procurement.opengov.com{href}",
+                        )
+                    )
+            if solicitations:
+                return solicitations
+    except requests.RequestException:
+        pass
+
+    return fetch_phoenix_legacy_solicitations(limit=limit, timeout=timeout, session=sess)
 
 
 def parse_opengov_bid_tab_export(

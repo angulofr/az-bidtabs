@@ -33,10 +33,12 @@ from src.db import (
 from src.matching import benchmark_schedule
 from src.scrapers import adot as adot_scraper
 from src.scrapers import phoenix_opengov as opengov_scraper
+from src.scrapers import scottsdale_bonfire as scottsdale_scraper
 from src.seed import seed_database
 
 importlib.reload(adot_scraper)
 importlib.reload(opengov_scraper)
+importlib.reload(scottsdale_scraper)
 
 st.set_page_config(
     page_title="AZ BidTabs | Arizona Heavy-Civil Bid Intelligence",
@@ -1068,7 +1070,7 @@ elif page == "Ingestion & Scrapers":
                     st.warning(f"Live E2C2 request failed (network/proxy or portal change): {exc}")
 
         with c_phx:
-            if st.button("Sync Phoenix OpenGov", type="primary"):
+            if st.button("Sync Phoenix Solicitations", type="primary"):
                 try:
                     res_og = opengov_scraper.run_phoenix_opengov_sync(DB_PATH, limit=15)
                     st.success(
@@ -1076,16 +1078,35 @@ elif page == "Ingestion & Scrapers":
                         f"New: {res_og['ingested']} | Skipped: {res_og['skipped']}"
                     )
                 except Exception as exc:
-                    st.warning(f"OpenGov sync failed: {exc}")
+                    st.warning(f"Phoenix sync failed: {exc}")
 
-            if st.button("Fetch Phoenix OpenGov Solicitations"):
+            if st.button("Fetch Phoenix Solicitations"):
                 try:
                     sols = opengov_scraper.fetch_phoenix_opengov_solicitations(limit=10)
                     st.success(f"Fetched {len(sols)} solicitations.")
                     if sols:
                         st.dataframe(pd.DataFrame([vars(s) for s in sols]), use_container_width=True)
                 except Exception as exc:
-                    st.warning(f"Live OpenGov request failed: {exc}")
+                    st.warning(f"Live Phoenix request failed: {exc}")
+
+            if st.button("Sync Scottsdale Bonfire", type="primary"):
+                try:
+                    res_sc = scottsdale_scraper.run_scottsdale_bonfire_sync(DB_PATH, limit=25)
+                    st.success(
+                        f"Discovered {res_sc['discovered']} civil opportunities | "
+                        f"New: {res_sc['ingested']} | Skipped: {res_sc['skipped']}"
+                    )
+                except Exception as exc:
+                    st.warning(f"Scottsdale Bonfire sync failed: {exc}")
+
+            if st.button("Fetch Scottsdale Bonfire"):
+                try:
+                    opps = scottsdale_scraper.fetch_scottsdale_bonfire_opportunities(limit=15)
+                    st.success(f"Fetched {len(opps)} Scottsdale civil opportunities.")
+                    if opps:
+                        st.dataframe(pd.DataFrame([vars(o) for o in opps]), use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"Live Scottsdale Bonfire request failed: {exc}")
 
         with c_reset:
             if PROD_MODE:

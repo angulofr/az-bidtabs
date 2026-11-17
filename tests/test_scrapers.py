@@ -297,3 +297,173 @@ def test_sync_adot_browser_upgrades_e2c2_only_projects(tmp_path: Path):
     ingest_parsed_project(parsed_pdf, db_path)
     assert "F069101C" in _get_already_pdf_archived_adot_nums(db_path)
 
+
+def test_phoenix_opengov_falls_back_to_legacy_awards(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.phoenix_opengov import (
+        PHOENIX_LEGACY_PORTAL,
+        PHOENIX_OPENGOV_API,
+        PHOENIX_OPENGOV_PORTAL,
+        fetch_phoenix_opengov_solicitations,
+        run_phoenix_opengov_sync,
+    )
+
+    api_resp = MagicMock(
+        ok=True,
+        status_code=200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        text="<!doctype html><html><body>SPA</body></html>",
+    )
+    cf_resp = MagicMock(
+        ok=False,
+        status_code=403,
+        headers={"content-type": "text/html"},
+        text="<title>Just a moment...</title><script src='https://challenges.cloudflare.com'></script>",
+    )
+    legacy_html = """
+    <html><body><table>
+      <tr><th>Number</th><th>Title</th><th>Buyer</th><th>Status</th></tr>
+      <tr>
+        <td><a href="/Solicitations/Details/1741">6000001568</a></td>
+        <td>CRISI RAILROAD IMPROVEMENTS - ST85100452</td>
+        <td>Kandi Kawolsky</td>
+        <td>Award Notice</td>
+      </tr>
+      <tr>
+        <td><a href="/Solicitations/Details/1841">6000001632</a></td>
+        <td>2024 SS4A RSAP SPEED LIMIT STUDY - ST89320174</td>
+        <td>Tonja Lepur</td>
+        <td>Award Notice</td>
+      </tr>
+    </table></body></html>
+    """
+    legacy_resp = MagicMock(
+        ok=True,
+        status_code=200,
+        headers={"content-type": "text/html"},
+        text=legacy_html,
+    )
+    legacy_resp.raise_for_status = MagicMock()
+
+    def fake_get(url, **kwargs):
+        if url == PHOENIX_OPENGOV_API:
+            return api_resp
+        if url == PHOENIX_OPENGOV_PORTAL:
+            return cf_resp
+        if url.startswith(PHOENIX_LEGACY_PORTAL):
+            return legacy_resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.side_effect = fake_get
+
+    sols = fetch_phoenix_opengov_solicitations(limit=10, session=mock_sess)
+    assert len(sols) == 2
+    assert sols[0].project_num == "6000001568"
+    assert sols[0].url == "https://solicitations.phoenix.gov/Solicitations/Details/1741"
+
+    db_path = tmp_path / "phx_fallback.db"
+    init_db(db_path)
+    res = run_phoenix_opengov_sync(db_path, limit=10, session=mock_sess)
+    assert res == {"discovered": 2, "ingested": 2, "skipped": 0}
+    with db_session(db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM projects WHERE agency = 'City of Phoenix'"
+        ).fetchone()[0]
+    assert count == 2
+
+
+def test_scottsdale_bonfire_fetch_and_sync(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.scottsdale_bonfire import (
+        SCOTTSDALE_PAST_OPPORTUNITIES_URL,
+        SCOTTSDALE_PUBLIC_CONTRACTS_URL,
+        fetch_scottsdale_bonfire_opportunities,
+        run_scottsdale_bonfire_sync,
+    )
+
+    past_payload = {
+        "payload": {
+            "projects": {
+                "81776": {
+                    "ProjectID": "81776",
+                    "ReferenceID": "IFB-122022-041",
+                    "ProjectName": "MILLER ROAD: PINNACLE PEAK RD TO HAPPY VALLEY RD",
+                    "DateClose": "2023-01-12 20:00:00",
+                    "IsPublicAward": True,
+                },
+                "64275": {
+                    "ProjectID": "64275",
+                    "ReferenceID": "IFB-032022-001",
+                    "ProjectName": "SWIMMING POOL CHEMICALS",
+                    "DateClose": "2022-04-26 20:00:00",
+                    "IsPublicAward": True,
+                },
+            }
+        }
+    }
+    contracts_payload = {
+        "payload": {
+            "vendors": [
+                {
+                    "VendorID": "9001",
+                    "VendorContactOrganizationName": "Pulice Construction, Inc.",
+                }
+            ],
+            "publicContracts": {
+                "1": {
+                    "ContractID": "1",
+                    "VendorID": "9001",
+                    "Name": "IFB-122022-041 - MILLER ROAD: PINNACLE PEAK RD TO HAPPY VALLEY RD",
+                }
+            },
+        }
+    }
+
+    past_resp = MagicMock(ok=True)
+    past_resp.raise_for_status = MagicMock()
+    past_resp.json.return_value = past_payload
+
+    contracts_resp = MagicMock(ok=True)
+    contracts_resp.json.return_value = contracts_payload
+
+    def fake_get(url, **kwargs):
+        if url == SCOTTSDALE_PAST_OPPORTUNITIES_URL:
+            return past_resp
+        if url == SCOTTSDALE_PUBLIC_CONTRACTS_URL:
+            return contracts_resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.side_effect = fake_get
+
+    opps = fetch_scottsdale_bonfire_opportunities(limit=10, civil_only=True, session=mock_sess)
+    assert len(opps) == 1
+    assert opps[0].reference_id == "IFB-122022-041"
+    assert opps[0].awarded_contractor == "Pulice Construction, Inc."
+
+    db_path = tmp_path / "scottsdale.db"
+    init_db(db_path)
+    res1 = run_scottsdale_bonfire_sync(db_path, limit=10, session=mock_sess)
+    assert res1 == {"discovered": 1, "ingested": 1, "skipped": 0}
+    res2 = run_scottsdale_bonfire_sync(db_path, limit=10, session=mock_sess)
+    assert res2 == {"discovered": 1, "ingested": 0, "skipped": 1}
+
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT p.agency_project_num, p.letting_date, c.canonical_name
+            FROM projects p
+            LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
+            WHERE p.agency = 'City of Scottsdale'
+            """
+        ).fetchone()
+    assert tuple(row) == ("IFB-122022-041", "2023-01-12", "PULICE CONSTRUCTION")
+
+
