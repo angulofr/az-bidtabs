@@ -524,6 +524,24 @@ def test_bonfire_multi_portal_goodyear_and_paradise_valley(tmp_path: Path):
             }
         ),
         BONFIRE_PORTALS["paradise_valley"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
+        BONFIRE_PORTALS["tempe"].past_opportunities_url: _resp(
+            {
+                "projects": {
+                    "4": {
+                        "ProjectID": "301",
+                        "ReferenceID": "26-101",
+                        "ProjectName": "Apache Blvd Streetscape & Storm Drain Improvements",
+                        "DateClose": "2026-02-01 15:00:00",
+                        "IsPublicAward": True,
+                    }
+                }
+            }
+        ),
+        BONFIRE_PORTALS["tempe"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
+        BONFIRE_PORTALS["peoria"].past_opportunities_url: _resp({"projects": {}}),
+        BONFIRE_PORTALS["peoria"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
+        BONFIRE_PORTALS["buckeye"].past_opportunities_url: _resp({"projects": {}}),
+        BONFIRE_PORTALS["buckeye"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
     }
 
     mock_sess = MagicMock()
@@ -539,6 +557,10 @@ def test_bonfire_multi_portal_goodyear_and_paradise_valley(tmp_path: Path):
     assert res["goodyear"]["ingested"] == 1
     assert res["paradise_valley"]["discovered"] == 1
     assert res["paradise_valley"]["ingested"] == 1
+    assert res["tempe"]["discovered"] == 1
+    assert res["tempe"]["ingested"] == 1
+    assert res["peoria"]["ingested"] == 0
+    assert res["buckeye"]["ingested"] == 0
 
     with db_session(db_path) as conn:
         rows = conn.execute(
@@ -551,6 +573,7 @@ def test_bonfire_multi_portal_goodyear_and_paradise_valley(tmp_path: Path):
         ).fetchall()
     assert [tuple(r) for r in rows] == [
         ("City of Goodyear", "23-0055", "AMES CONSTRUCTION"),
+        ("City of Tempe", "26-101", None),
         ("Town of Paradise Valley", "25-001-ENG CMAR", None),
     ]
 

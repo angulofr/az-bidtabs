@@ -4,6 +4,9 @@ Supports unauthenticated JSON endpoints exposed by Bonfire municipal portals:
 - City of Scottsdale (`scottsdaleaz.bonfirehub.com`)
 - City of Goodyear (`goodyearaz.bonfirehub.com`)
 - Town of Paradise Valley (`paradisevalleyaz.bonfirehub.com`)
+- City of Tempe (`tempe-gov.bonfirehub.com`)
+- City of Peoria (`peoriaaz.bonfirehub.com`)
+- City of Buckeye (`buckeyeaz.bonfirehub.com`)
 """
 
 from __future__ import annotations
@@ -53,6 +56,24 @@ BONFIRE_PORTALS: dict[str, BonfirePortalConfig] = {
         key="paradise_valley",
         agency="Town of Paradise Valley",
         base_url="https://paradisevalleyaz.bonfirehub.com",
+        county="Maricopa",
+    ),
+    "tempe": BonfirePortalConfig(
+        key="tempe",
+        agency="City of Tempe",
+        base_url="https://tempe-gov.bonfirehub.com",
+        county="Maricopa",
+    ),
+    "peoria": BonfirePortalConfig(
+        key="peoria",
+        agency="City of Peoria",
+        base_url="https://peoriaaz.bonfirehub.com",
+        county="Maricopa",
+    ),
+    "buckeye": BonfirePortalConfig(
+        key="buckeye",
+        agency="City of Buckeye",
+        base_url="https://buckeyeaz.bonfirehub.com",
         county="Maricopa",
     ),
 }
