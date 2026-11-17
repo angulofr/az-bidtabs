@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,7 @@ from bs4 import BeautifulSoup
 
 from src.db import db_session
 from src.scrapers.adot import ParsedBidLine, ParsedProjectBidTab, ingest_parsed_project
+from src.scrapers.bonfire import is_civil_project
 
 BIDSYNC_MARICOPA_SEARCH_URL = (
     "https://www.bidsync.com/bidsync-app-web/shared/shared/"
@@ -21,8 +23,9 @@ BIDSYNC_MARICOPA_SEARCH_URL = (
 BIDSYNC_SEARCH_POST_URL = (
     "https://www.bidsync.com/bidsync-app-web/shared/shared/embeddedSearchResults.xhtml"
 )
+_BIDSYNC_TABLE_ID = "elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults"
 DEFAULT_CIVIL_QUERY = (
-    "asphalt OR roadway OR pavement OR concrete OR waterline OR sewer OR drainage OR bridge OR traffic"
+    "DBB OR asphalt OR roadway OR pavement OR concrete OR waterline OR sewer OR drainage OR bridge OR traffic"
 )
 
 _MONEY_RE = re.compile(r"^\$?\s*([\d,]+\.\d{2,4})$")
@@ -79,10 +82,67 @@ def _parse_qty(val: str) -> float | None:
     return float(cleaned.replace(",", ""))
 
 
+def _extract_listings_from_soup(
+    soup: BeautifulSoup,
+    seen_tabs: set[str],
+    *,
+    civil_only: bool = True,
+) -> list[BidSyncListing]:
+    batch: list[BidSyncListing] = []
+    for tr in soup.select("tr"):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 6:
+            continue
+        tab_anchor = tr.find("a", href=lambda h: h and "awgroup" in h)
+        if not tab_anchor:
+            continue
+        proj_num = tds[0].get_text(" ", strip=True)
+        title = tds[1].get_text(" ", strip=True)
+        agency = tds[2].get_text(" ", strip=True)
+        end_date = _parse_bidsync_date(tds[4].get_text(" ", strip=True))
+        tab_url = _normalize_bidsync_tab_url(str(tab_anchor.get("href") or ""))
+        if not proj_num or not tab_url or tab_url in seen_tabs:
+            continue
+        if civil_only and not is_civil_project(title):
+            continue
+        seen_tabs.add(tab_url)
+        batch.append(
+            BidSyncListing(
+                project_num=proj_num,
+                title=title,
+                agency=agency,
+                end_date=end_date,
+                tab_url=tab_url,
+            )
+        )
+    return batch
+
+
+def _parse_primefaces_ajax_response(xml_text: str) -> tuple[BeautifulSoup | None, str | None]:
+    """Extract HTML table update and updated ViewState from PrimeFaces partial XML."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None, None
+    html_chunks: list[str] = []
+    new_vs: str | None = None
+    for upd in root.findall(".//update"):
+        uid = upd.get("id") or ""
+        text = upd.text or ""
+        if _BIDSYNC_TABLE_ID in uid:
+            html_chunks.append(text)
+        elif "ViewState" in uid and text.strip():
+            new_vs = text.strip()
+    if not html_chunks:
+        return None, new_vs
+    return BeautifulSoup("".join(html_chunks), "html.parser"), new_vs
+
+
 def fetch_bidsync_listings(
     limit: int = 20,
     *,
     query: str = DEFAULT_CIVIL_QUERY,
+    civil_only: bool = True,
     timeout: int = 25,
     session: requests.Session | None = None,
 ) -> list[BidSyncListing]:
@@ -115,37 +175,57 @@ def fetch_bidsync_listings(
             html = post_resp.text
 
     soup = BeautifulSoup(html, "html.parser")
-    listings: list[BidSyncListing] = []
     seen_tabs: set[str] = set()
+    listings = _extract_listings_from_soup(soup, seen_tabs, civil_only=civil_only)
 
-    for tr in soup.select("table tr"):
-        tds = tr.find_all("td", recursive=False)
-        if len(tds) < 6:
-            continue
-        tab_anchor = tr.find("a", href=lambda h: h and "awgroup" in h)
-        if not tab_anchor:
-            continue
-        proj_num = tds[0].get_text(" ", strip=True)
-        title = tds[1].get_text(" ", strip=True)
-        agency = tds[2].get_text(" ", strip=True)
-        end_date = _parse_bidsync_date(tds[4].get_text(" ", strip=True))
-        tab_url = _normalize_bidsync_tab_url(str(tab_anchor.get("href") or ""))
-        if not proj_num or not tab_url or tab_url in seen_tabs:
-            continue
-        seen_tabs.add(tab_url)
-        listings.append(
-            BidSyncListing(
-                project_num=proj_num,
-                title=title,
-                agency=agency,
-                end_date=end_date,
-                tab_url=tab_url,
+    # Paginate via PrimeFaces AJAX in chunks of 50 when more historical bids are requested
+    vs_input = soup.find("input", {"name": "javax.faces.ViewState"})
+    vs_val = str(vs_input.get("value") or "") if vs_input else ""
+    first_offset = 10
+    max_ajax_pages = 10
+
+    for _ in range(max_ajax_pages):
+        if len(listings) >= limit or not vs_val:
+            break
+        ajax_data = {
+            "javax.faces.partial.ajax": "true",
+            "javax.faces.source": _BIDSYNC_TABLE_ID,
+            "javax.faces.partial.execute": _BIDSYNC_TABLE_ID,
+            "javax.faces.partial.render": _BIDSYNC_TABLE_ID,
+            _BIDSYNC_TABLE_ID: _BIDSYNC_TABLE_ID,
+            f"{_BIDSYNC_TABLE_ID}_pagination": "true",
+            f"{_BIDSYNC_TABLE_ID}_first": str(first_offset),
+            f"{_BIDSYNC_TABLE_ID}_rows": "50",
+            f"{_BIDSYNC_TABLE_ID}_encodeFeature": "true",
+            "elasticBidSearchForm": "elasticBidSearchForm",
+            "elasticBidSearchForm:bidSearchParametersComponent:j_idt323": query,
+            f"{_BIDSYNC_TABLE_ID}_rppDD": "50",
+            "javax.faces.ViewState": vs_val,
+        }
+        try:
+            ajax_resp = sess.post(BIDSYNC_SEARCH_POST_URL, data=ajax_data, timeout=timeout)
+            if not ajax_resp.ok:
+                break
+            ajax_soup, next_vs = _parse_primefaces_ajax_response(ajax_resp.text)
+            if next_vs:
+                vs_val = next_vs
+            if ajax_soup is None:
+                break
+            raw_data_rows = sum(
+                1 for tr in ajax_soup.select("tr") if len(tr.find_all("td", recursive=False)) >= 6
             )
-        )
-        if len(listings) >= limit:
+            if raw_data_rows == 0:
+                break
+            listings.extend(
+                _extract_listings_from_soup(ajax_soup, seen_tabs, civil_only=civil_only)
+            )
+            first_offset += raw_data_rows
+            if raw_data_rows < 50:
+                break
+        except requests.RequestException:
             break
 
-    return listings
+    return listings[:limit]
 
 
 def _split_item_code_and_desc(raw_label: str, fallback_idx: int) -> tuple[str, str]:

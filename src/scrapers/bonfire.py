@@ -109,6 +109,15 @@ _CIVIL_KEYWORDS = (
     "RECLAMATION",
     "RESERVOIR",
     "CMAR",
+    "DAM",
+    "LEVEE",
+    "WASH",
+    "REHAB",
+    "PRESERVATION",
+    "OVERLAY",
+    "MILL",
+    "FCD",
+    "TT0",
 )
 
 

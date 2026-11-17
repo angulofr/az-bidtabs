@@ -57,7 +57,7 @@ def main() -> int:
 
     try:
         report["mcdot_bidsync"] = run_maricopa_bidsync_sync(
-            args.db, limit=min(args.limit, 15), dry_run=args.dry_run
+            args.db, limit=args.limit, dry_run=args.dry_run
         )
     except Exception as exc:
         report["mcdot_bidsync"] = {"error": str(exc)}

@@ -754,3 +754,60 @@ def test_mesa_and_chandler_metadata_sync(tmp_path: Path):
     ]
 
 
+def test_bidsync_primefaces_ajax_pagination():
+    from unittest.mock import MagicMock
+
+    from src.scrapers.maricopa_bidsync import (
+        BIDSYNC_MARICOPA_SEARCH_URL,
+        fetch_bidsync_listings,
+    )
+
+    page0_html = """
+    <html><body>
+      <form id="elasticBidSearchForm">
+        <input type="hidden" name="javax.faces.ViewState" value="vs-0" />
+        <input type="text" name="elasticBidSearchForm:bidSearchParametersComponent:j_idt323" value="" />
+      </form>
+      <table><tr>
+        <td>220014-DBB</td><td>Lower Buckeye Road - 71st Av to 67th Av</td><td>Maricopa County</td>
+        <td>Arizona</td><td>Oct 19, 2021 2:00:00 PM MST</td><td>Bid has ended</td>
+        <td><a href="https://www.bidsync.com/DPX?ac=awgroupreview&auc=2082474&supsrch=">Tab</a></td>
+      </tr></table>
+    </body></html>
+    """
+    ajax_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <partial-response><changes>
+      <update id="elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults"><![CDATA[
+        <table>
+          <tr>
+            <td>230049-DBB</td><td>Sun Lakes Pavement Rehab Units 11-22</td><td>Maricopa County</td>
+            <td>Arizona</td><td>Jan 31, 2023 2:00:00 PM MST</td><td>Bid has ended</td>
+            <td><a href="https://www.bidsync.com/DPX?ac=awgrouplist&auc=2099999&supsrch=">Tab</a></td>
+          </tr>
+          <tr>
+            <td>200025-DBB</td><td>Renovations of Central Courts</td><td>Maricopa County</td>
+            <td>Arizona</td><td>Jan 07, 2020 2:00:00 PM MST</td><td>Bid has ended</td>
+            <td><a href="https://www.bidsync.com/DPX?ac=awgroupreview&auc=2055555&supsrch=">Tab</a></td>
+          </tr>
+        </table>
+      ]]></update>
+      <update id="j_id1:javax.faces.ViewState:0"><![CDATA[vs-1]]></update>
+    </changes></partial-response>
+    """
+    get_resp = MagicMock(ok=True, text=page0_html)
+    get_resp.raise_for_status = MagicMock()
+    post_init_resp = MagicMock(ok=True, text=page0_html)
+    post_init_resp.raise_for_status = MagicMock()
+    post_ajax_resp = MagicMock(ok=True, text=ajax_xml)
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.return_value = get_resp
+    mock_sess.post.side_effect = [post_init_resp, post_ajax_resp]
+
+    listings = fetch_bidsync_listings(limit=10, session=mock_sess)
+    assert [l.project_num for l in listings] == ["220014-DBB", "230049-DBB"]
+    assert "ac=awgroupreview" in listings[1].tab_url
+    assert "expandall=Y" in listings[1].tab_url
+
+
