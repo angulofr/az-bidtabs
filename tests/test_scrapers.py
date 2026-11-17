@@ -467,3 +467,91 @@ def test_scottsdale_bonfire_fetch_and_sync(tmp_path: Path):
     assert tuple(row) == ("IFB-122022-041", "2023-01-12", "PULICE CONSTRUCTION")
 
 
+def test_bonfire_multi_portal_goodyear_and_paradise_valley(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.bonfire import BONFIRE_PORTALS, run_all_bonfire_syncs
+
+    def _resp(payload):
+        r = MagicMock(ok=True)
+        r.raise_for_status = MagicMock()
+        r.json.return_value = {"payload": payload}
+        return r
+
+    routes = {
+        BONFIRE_PORTALS["scottsdale"].past_opportunities_url: _resp({"projects": {}}),
+        BONFIRE_PORTALS["scottsdale"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
+        BONFIRE_PORTALS["goodyear"].past_opportunities_url: _resp(
+            {
+                "projects": {
+                    "1": {
+                        "ProjectID": "101",
+                        "ReferenceID": "23-0055",
+                        "ProjectName": "CMAR - Estrella Parkway from Vineyard to MC85",
+                        "DateClose": "2022-12-05 15:00:00",
+                        "IsPublicAward": True,
+                    },
+                    "2": {
+                        "ProjectID": "102",
+                        "ReferenceID": "RFP 23-0123",
+                        "ProjectName": "Auditing Services",
+                        "DateClose": "2023-04-04 15:00:00",
+                        "IsPublicAward": True,
+                    },
+                }
+            }
+        ),
+        BONFIRE_PORTALS["goodyear"].public_contracts_url: _resp(
+            {
+                "vendors": [{"VendorID": "7", "VendorContactOrganizationName": "Ames Construction, Inc."}],
+                "publicContracts": {
+                    "1": {"ContractID": "1", "VendorID": "7", "Name": "23-0055 - Estrella Parkway"}
+                },
+            }
+        ),
+        BONFIRE_PORTALS["paradise_valley"].past_opportunities_url: _resp(
+            {
+                "projects": {
+                    "3": {
+                        "ProjectID": "201",
+                        "ReferenceID": "25-001-ENG CMAR",
+                        "ProjectName": "Roadway and Drainage Improvements, Mockingbird Lane",
+                        "DateClose": "2024-07-17 14:00:00",
+                        "IsPublicAward": True,
+                    }
+                }
+            }
+        ),
+        BONFIRE_PORTALS["paradise_valley"].public_contracts_url: _resp({"vendors": [], "publicContracts": {}}),
+    }
+
+    mock_sess = MagicMock()
+    mock_sess.headers = {}
+    mock_sess.get.side_effect = lambda url, **kw: routes[url]
+
+    db_path = tmp_path / "bonfire_all.db"
+    init_db(db_path)
+    res = run_all_bonfire_syncs(db_path, limit=10, session=mock_sess)
+
+    assert res["scottsdale"]["ingested"] == 0
+    assert res["goodyear"]["discovered"] == 1
+    assert res["goodyear"]["ingested"] == 1
+    assert res["paradise_valley"]["discovered"] == 1
+    assert res["paradise_valley"]["ingested"] == 1
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT p.agency, p.agency_project_num, c.canonical_name
+            FROM projects p
+            LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
+            ORDER BY p.agency
+            """
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("City of Goodyear", "23-0055", "AMES CONSTRUCTION"),
+        ("Town of Paradise Valley", "25-001-ENG CMAR", None),
+    ]
+
+

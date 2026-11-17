@@ -32,13 +32,13 @@ from src.db import (
 )
 from src.matching import benchmark_schedule
 from src.scrapers import adot as adot_scraper
+from src.scrapers import bonfire as bonfire_scraper
 from src.scrapers import phoenix_opengov as opengov_scraper
-from src.scrapers import scottsdale_bonfire as scottsdale_scraper
 from src.seed import seed_database
 
 importlib.reload(adot_scraper)
+importlib.reload(bonfire_scraper)
 importlib.reload(opengov_scraper)
-importlib.reload(scottsdale_scraper)
 
 st.set_page_config(
     page_title="AZ BidTabs | Arizona Heavy-Civil Bid Intelligence",
@@ -1089,24 +1089,35 @@ elif page == "Ingestion & Scrapers":
                 except Exception as exc:
                     st.warning(f"Live Phoenix request failed: {exc}")
 
-            if st.button("Sync Scottsdale Bonfire", type="primary"):
+            if st.button("Sync All AZ Bonfire Portals", type="primary"):
                 try:
-                    res_sc = scottsdale_scraper.run_scottsdale_bonfire_sync(DB_PATH, limit=25)
-                    st.success(
-                        f"Discovered {res_sc['discovered']} civil opportunities | "
-                        f"New: {res_sc['ingested']} | Skipped: {res_sc['skipped']}"
-                    )
+                    res_bf = bonfire_scraper.run_all_bonfire_syncs(DB_PATH, limit=25)
+                    summary_parts = [
+                        f"{info.get('agency', key)}: +{info.get('ingested', 0)}/{info.get('discovered', 0)}"
+                        if "error" not in info
+                        else f"{info.get('agency', key)}: error"
+                        for key, info in res_bf.items()
+                    ]
+                    st.success(" | ".join(summary_parts))
                 except Exception as exc:
-                    st.warning(f"Scottsdale Bonfire sync failed: {exc}")
+                    st.warning(f"Bonfire sync failed: {exc}")
 
-            if st.button("Fetch Scottsdale Bonfire"):
+            bf_key = st.selectbox(
+                "Bonfire Municipality",
+                options=list(bonfire_scraper.BONFIRE_PORTALS.keys()),
+                format_func=lambda k: bonfire_scraper.BONFIRE_PORTALS[k].agency,
+            )
+            if st.button("Fetch Bonfire Opportunities"):
                 try:
-                    opps = scottsdale_scraper.fetch_scottsdale_bonfire_opportunities(limit=15)
-                    st.success(f"Fetched {len(opps)} Scottsdale civil opportunities.")
+                    opps = bonfire_scraper.fetch_bonfire_opportunities(bf_key, limit=15)
+                    st.success(
+                        f"Fetched {len(opps)} civil opportunities from "
+                        f"{bonfire_scraper.BONFIRE_PORTALS[bf_key].agency}."
+                    )
                     if opps:
                         st.dataframe(pd.DataFrame([vars(o) for o in opps]), use_container_width=True)
                 except Exception as exc:
-                    st.warning(f"Live Scottsdale Bonfire request failed: {exc}")
+                    st.warning(f"Live Bonfire request failed: {exc}")
 
         with c_reset:
             if PROD_MODE:
