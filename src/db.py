@@ -796,6 +796,44 @@ def get_contractor_scorecard(db_path: Path | str | None = None) -> pd.DataFrame:
     return df
 
 
+def get_head_to_head_opponents(
+    db_path: Path | str | None = None,
+) -> dict[str, list[tuple[str, int]]]:
+    """Return mapping of contractor -> [(opponent_name, overlapping_projects), ...].
+
+    Only includes contractor pairs that have at least one overlapping non-estimate project.
+    """
+    sql = """
+        WITH contractor_projects AS (
+            SELECT DISTINCT bl.project_id, c.canonical_name
+            FROM bid_lines bl
+            JOIN contractors c ON bl.contractor_id = c.contractor_id
+            WHERE bl.is_engineers_estimate = 0
+        )
+        SELECT
+            a.canonical_name AS contractor_a,
+            b.canonical_name AS contractor_b,
+            COUNT(DISTINCT a.project_id) AS overlapping_projects
+        FROM contractor_projects a
+        JOIN contractor_projects b
+          ON a.project_id = b.project_id
+         AND a.canonical_name <> b.canonical_name
+        GROUP BY a.canonical_name, b.canonical_name
+        ORDER BY a.canonical_name, overlapping_projects DESC, b.canonical_name
+    """
+    with db_session(db_path) as conn:
+        df = conn.query_df(sql)
+    if df.empty:
+        return {}
+    opponents: dict[str, list[tuple[str, int]]] = {}
+    for _, row in df.iterrows():
+        ca = str(row["contractor_a"])
+        cb = str(row["contractor_b"])
+        cnt = int(row["overlapping_projects"])
+        opponents.setdefault(ca, []).append((cb, cnt))
+    return opponents
+
+
 def get_head_to_head(
     contractor_a: str,
     contractor_b: str,

@@ -24,6 +24,7 @@ from src.db import (
     get_database_url,
     get_filter_options,
     get_head_to_head,
+    get_head_to_head_opponents,
     get_item_code_details,
     get_overview_stats,
     init_db,
@@ -703,73 +704,88 @@ elif page == "Competitor Intel & Head-to-Head":
         if not scorecard.empty
         else {}
     )
-    if len(contractor_names) >= 2:
+    opponents_map = get_head_to_head_opponents(DB_PATH)
+    available_a = [name for name in contractor_names if name in opponents_map]
+
+    def _format_contractor(name: str, shared_count: int | None = None) -> str:
+        parts: list[str] = []
+        emp = emp_lookup.get(name)
+        if pd.notna(emp):
+            parts.append(f"~{int(emp):,} emp")
+        if shared_count is not None:
+            parts.append(f"{shared_count} shared")
+        return f"{name} ({', '.join(parts)})" if parts else name
+
+    if available_a:
         ca, cb = st.columns(2)
         contractor_a = ca.selectbox(
             "Contractor A (Your Firm / Target)",
-            contractor_names,
+            available_a,
             index=0,
-            format_func=lambda n: f"{n} (~{int(emp_lookup[n]):,} emp)" if pd.notna(emp_lookup.get(n)) else n,
+            key="h2h_contractor_a",
+            format_func=lambda n: _format_contractor(n),
         )
-        default_b_idx = 1 if len(contractor_names) > 1 else 0
+        b_opponents = opponents_map.get(contractor_a, [])
+        b_names = [opp for opp, _ in b_opponents]
+        b_overlap_lookup = dict(b_opponents)
         contractor_b = cb.selectbox(
             "Contractor B (Competitor)",
-            contractor_names,
-            index=default_b_idx,
-            format_func=lambda n: f"{n} (~{int(emp_lookup[n]):,} emp)" if pd.notna(emp_lookup.get(n)) else n,
+            b_names,
+            index=0,
+            key="h2h_contractor_b",
+            format_func=lambda n: _format_contractor(n, b_overlap_lookup.get(n)),
         )
 
-        if contractor_a == contractor_b:
-            st.warning("Select two different contractors for Head-to-Head comparison.")
+        proj_h2h, line_h2h = get_head_to_head(contractor_a, contractor_b, DB_PATH)
+        if proj_h2h.empty:
+            st.info(f"No overlapping projects found between {contractor_a} and {contractor_b}.")
         else:
-            proj_h2h, line_h2h = get_head_to_head(contractor_a, contractor_b, DB_PATH)
-            if proj_h2h.empty:
-                st.info(f"No overlapping projects found between {contractor_a} and {contractor_b}.")
-            else:
-                a_wins = int((proj_h2h["a_total"] < proj_h2h["b_total"]).sum())
-                b_wins = int((proj_h2h["b_total"] < proj_h2h["a_total"]).sum())
-                avg_spread = float(proj_h2h["a_vs_b_pct"].mean())
+            a_wins = int((proj_h2h["a_total"] < proj_h2h["b_total"]).sum())
+            b_wins = int((proj_h2h["b_total"] < proj_h2h["a_total"]).sum())
+            avg_spread = float(proj_h2h["a_vs_b_pct"].mean())
 
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Overlapping Projects", len(proj_h2h))
-                k2.metric(f"{contractor_a[:18]} Lower", a_wins)
-                k3.metric(f"{contractor_b[:18]} Lower", b_wins)
-                k4.metric("Avg A vs. B Spread", f"{avg_spread:+.2f}%")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Overlapping Projects", len(proj_h2h))
+            k2.metric(f"{contractor_a[:18]} Lower", a_wins)
+            k3.metric(f"{contractor_b[:18]} Lower", b_wins)
+            k4.metric("Avg A vs. B Spread", f"{avg_spread:+.2f}%")
 
-                st.markdown("**Overlapping Projects**")
-                st.dataframe(
-                    proj_h2h.drop(columns=["project_id"]),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "engineers_estimate": st.column_config.NumberColumn("Engineer's Est.", format="$%,.0f"),
-                        "a_total": st.column_config.NumberColumn("A Total", format="$%,.0f"),
-                        "a_rank": st.column_config.NumberColumn("A Rank", format="%d"),
-                        "b_total": st.column_config.NumberColumn("B Total", format="$%,.0f"),
-                        "b_rank": st.column_config.NumberColumn("B Rank", format="%d"),
-                        "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
-                    },
-                )
+            st.markdown("**Overlapping Projects**")
+            st.dataframe(
+                proj_h2h.drop(columns=["project_id"]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "engineers_estimate": st.column_config.NumberColumn("Engineer's Est.", format="$%,.0f"),
+                    "a_total": st.column_config.NumberColumn("A Total", format="$%,.0f"),
+                    "a_rank": st.column_config.NumberColumn("A Rank", format="%d"),
+                    "b_total": st.column_config.NumberColumn("B Total", format="$%,.0f"),
+                    "b_rank": st.column_config.NumberColumn("B Rank", format="%d"),
+                    "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
+                },
+            )
 
-                st.markdown("**Line-Item Unit Price Comparison (Sorted by $ Impact)**")
-                st.caption("Tip: Click any **Item Code** below to open a new tab with pricing from **all contractors**.")
-                st.dataframe(
-                    _with_clickable_item_links(line_h2h, "item_code", "spec_system"),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "item_code": st.column_config.LinkColumn(
-                            "Item Code",
-                            help="Open all-contractor details for this item code in a new tab",
-                            display_text=_ITEM_LINK_DISPLAY_RE,
-                        ),
-                        "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
-                        "a_unit_price": st.column_config.NumberColumn("A Unit Price", format="$%,.2f"),
-                        "b_unit_price": st.column_config.NumberColumn("B Unit Price", format="$%,.2f"),
-                        "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
-                        "extended_diff": st.column_config.NumberColumn("Extended Diff ($)", format="$%,.2f"),
-                    },
-                )
+            st.markdown("**Line-Item Unit Price Comparison (Sorted by $ Impact)**")
+            st.caption("Tip: Click any **Item Code** below to open a new tab with pricing from **all contractors**.")
+            st.dataframe(
+                _with_clickable_item_links(line_h2h, "item_code", "spec_system"),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "item_code": st.column_config.LinkColumn(
+                        "Item Code",
+                        help="Open all-contractor details for this item code in a new tab",
+                        display_text=_ITEM_LINK_DISPLAY_RE,
+                    ),
+                    "quantity": st.column_config.NumberColumn("Quantity", format="%,.0f"),
+                    "a_unit_price": st.column_config.NumberColumn("A Unit Price", format="$%,.2f"),
+                    "b_unit_price": st.column_config.NumberColumn("B Unit Price", format="$%,.2f"),
+                    "a_vs_b_pct": st.column_config.NumberColumn("A vs. B (%)", format="%.2f%%"),
+                    "extended_diff": st.column_config.NumberColumn("Extended Diff ($)", format="$%,.2f"),
+                },
+            )
+    else:
+        st.info("No overlapping head-to-head contractor bids found yet.")
 
 
 # ---------------------------------------------------------------------------

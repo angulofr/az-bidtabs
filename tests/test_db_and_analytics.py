@@ -227,4 +227,61 @@ def test_get_item_code_details_all_contractors(tmp_path: Path):
     assert "DEPARTMENT ESTIMATE" in set(lines_df["bidder_name"])
 
 
+def test_get_head_to_head_opponents_filters_non_overlapping(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_head_to_head_opponents,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+    )
+
+    db_path = tmp_path / "h2h_opponents.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        cid_a = upsert_contractor(conn, "ALPHA PAVING INC")
+        cid_b = upsert_contractor(conn, "BETA CIVIL LLC")
+        cid_c = upsert_contractor(conn, "GAMMA EXCAVATING CORP")
+        cid_d = upsert_contractor(conn, "DELTA SOLO LLC")
+
+        p1 = upsert_project(conn, agency="ADOT", agency_project_num="P1", title="Proj 1")
+        p2 = upsert_project(conn, agency="ADOT", agency_project_num="P2", title="Proj 2")
+        p3 = upsert_project(conn, agency="ADOT", agency_project_num="P3", title="Proj 3")
+        p4 = upsert_project(conn, agency="ADOT", agency_project_num="P4", title="Proj 4")
+        item_id = upsert_pay_item(conn, "ADOT", "2030301", "ROADWAY EXCAVATION", "CU.YD.")
+
+        # P1: A and B; P2: A and B; P3: A and C; P4: D alone (+ Engineer's Estimate)
+        for pid, cid in [(p1, cid_a), (p1, cid_b), (p2, cid_a), (p2, cid_b), (p3, cid_a), (p3, cid_c), (p4, cid_d)]:
+            insert_bid_line(
+                conn,
+                project_id=pid,
+                contractor_id=cid,
+                is_engineers_estimate=False,
+                item_id=item_id,
+                quantity=100.0,
+                unit_price=15.0,
+            )
+        insert_bid_line(
+            conn,
+            project_id=p4,
+            contractor_id=None,
+            is_engineers_estimate=True,
+            item_id=item_id,
+            quantity=100.0,
+            unit_price=14.0,
+        )
+
+    opponents = get_head_to_head_opponents(db_path)
+    assert opponents == {
+        "ALPHA PAVING": [("BETA CIVIL", 2), ("GAMMA EXCAVATING", 1)],
+        "BETA CIVIL": [("ALPHA PAVING", 2)],
+        "GAMMA EXCAVATING": [("ALPHA PAVING", 1)],
+    }
+    assert "DELTA SOLO" not in opponents
+
+
+
 
