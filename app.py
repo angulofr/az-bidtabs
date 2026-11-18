@@ -17,9 +17,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.contractor_profiles import backfill_contractor_profiles
 from src.db import (
     DEFAULT_DB_PATH,
     compute_unit_price_stats,
+    get_all_contractors,
+    get_all_pay_items,
+    get_all_projects,
     get_contractor_scorecard,
     get_database_url,
     get_filter_options,
@@ -65,6 +69,29 @@ st.markdown(
         border-radius: 10px;
         padding: 14px 16px;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .st-key-overview_kpi_cards button {
+        background-color: #FFFFFF !important;
+        border: 1px solid #E2E8F0 !important;
+        border-radius: 10px !important;
+        padding: 14px 16px !important;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04) !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+        align-items: flex-start !important;
+        height: auto !important;
+        min-height: 98px !important;
+        color: #0F172A !important;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .st-key-overview_kpi_cards button:hover {
+        border-color: #D97706 !important;
+        box-shadow: 0 3px 8px rgba(217, 119, 6, 0.12) !important;
+    }
+    .st-key-overview_kpi_cards button p {
+        margin: 0 !important;
+        line-height: 1.35 !important;
+        width: 100%;
     }
     .az-badge {
         display: inline-block;
@@ -154,6 +181,14 @@ else:
     seed_database(DB_PATH)
 
 
+@st.cache_data(ttl=3600)
+def _backfill_profiles_once(_db_key: str) -> int:
+    return backfill_contractor_profiles(DB_PATH)
+
+
+_backfill_profiles_once(str(DB_PATH))
+
+
 # ---------------------------------------------------------------------------
 # Clickable Item Code Links & New-Tab Detail Helpers
 # ---------------------------------------------------------------------------
@@ -209,10 +244,207 @@ def _with_clickable_item_links(
 
 
 def _clear_item_query_param() -> None:
+    st.session_state.pop("overview_detail", None)
     try:
         st.query_params.clear()
     except Exception:
         pass
+
+
+def _render_overview_detail_page(detail_key: str, stats: dict) -> None:
+    titles = {
+        "projects": ("All Archived Projects", f"{stats['projects']:,} total projects across all agencies"),
+        "contractors": ("All Tracked Contractors", f"{stats['contractors']:,} contractors & vendors tracked"),
+        "pay_items": ("Unique Pay Items Catalog", f"{stats['pay_items']:,} ADOT & MAG pay items"),
+        "awarded": ("Awarded Contracts & Volume", f"${stats['total_awarded_volume'] / 1e6:,.1f}M total awarded bid volume"),
+    }
+    heading, subtitle = titles.get(detail_key, ("Details", ""))
+    top_l, top_r = st.columns([4, 1.3])
+    with top_l:
+        st.title(heading)
+        st.caption(subtitle)
+    with top_r:
+        if st.button("← Back to Overview", key="back_to_overview_btn", use_container_width=True):
+            st.session_state.pop("overview_detail", None)
+            st.rerun()
+
+    opts = get_filter_options(DB_PATH)
+
+    if detail_key in ("projects", "awarded"):
+        awarded_only = detail_key == "awarded"
+        f1, f2, f3 = st.columns([2.2, 1.2, 1.2])
+        q = f1.text_input(
+            "Search Project #, Title, or Contractor",
+            key=f"{detail_key}_search",
+            placeholder="e.g. Loop 101, 220014-DBB, Sunland...",
+        )
+        ag = f2.selectbox("Agency", ["ALL"] + opts["agencies"], key=f"{detail_key}_agency")
+        co = f3.selectbox("County", ["ALL"] + opts["counties"], key=f"{detail_key}_county")
+
+        df = get_all_projects(
+            DB_PATH,
+            agency=ag,
+            county=co,
+            search=q,
+            awarded_only=awarded_only,
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Matching Projects", f"{len(df):,}")
+        m2.metric(
+            "Total Awarded ($)",
+            f"${df['winning_bid_total'].fillna(0).sum() / 1e6:,.2f}M" if not df.empty else "$0.00M",
+        )
+        m3.metric(
+            "Projects With Line Items",
+            f"{int((df['bid_line_count'] > 0).sum()):,}" if not df.empty else "0",
+        )
+
+        if awarded_only and not df.empty:
+            ag_award = (
+                df.groupby("agency", as_index=False)["winning_bid_total"]
+                .sum()
+                .sort_values("winning_bid_total", ascending=False)
+            )
+            fig = px.bar(
+                ag_award,
+                x="winning_bid_total",
+                y="agency",
+                orientation="h",
+                labels={"winning_bid_total": "Awarded Volume ($)", "agency": "Agency"},
+                color="winning_bid_total",
+                color_continuous_scale="YlOrBr",
+            )
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        if df.empty:
+            st.info("No matching projects found.")
+        else:
+            st.dataframe(
+                df.drop(columns=["project_id"]),
+                use_container_width=True,
+                hide_index=True,
+                height=520,
+                column_config={
+                    "agency": "Agency",
+                    "agency_project_num": "Project #",
+                    "title": "Title",
+                    "county": "County",
+                    "letting_date": "Letting / Close Date",
+                    "engineers_estimate": st.column_config.NumberColumn("Engineer's Est.", format="$%,.0f"),
+                    "winning_bid_total": st.column_config.NumberColumn("Winning Bid", format="$%,.0f"),
+                    "awarded_contractor": "Awarded Contractor",
+                    "contractor_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
+                    "bid_line_count": st.column_config.NumberColumn("Bid Lines", format="%d"),
+                    "source_url": st.column_config.LinkColumn("Source", display_text="Open"),
+                },
+            )
+            st.download_button(
+                "Download Projects CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"az_bidtabs_{detail_key}.csv",
+                mime="text/csv",
+            )
+
+    elif detail_key == "contractors":
+        f1, f2 = st.columns([2.5, 1.2])
+        q = f1.text_input(
+            "Search Contractor Name",
+            key="contractors_search",
+            placeholder="e.g. Ames, Pulice, Nesbitt, Sunland...",
+        )
+        only_with_emp = f2.checkbox("Only with Employee Estimate", value=False, key="contractors_emp_only")
+        df = get_all_contractors(DB_PATH, search=q)
+        if only_with_emp and not df.empty:
+            df = df[df["approx_employees"].notna()]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Matching Contractors", f"{len(df):,}")
+        m2.metric(
+            "With Employee Estimates",
+            f"{int(df['approx_employees'].notna().sum()):,}" if not df.empty else "0",
+        )
+        m3.metric(
+            "Total Projects Awarded",
+            f"{int(df['projects_awarded'].sum()):,}" if not df.empty else "0",
+        )
+        st.caption(
+            "Approx. Employees are estimated from public corporate disclosures and industry directories "
+            "(AZ Dept. of Revenue and AZ ROC do not publish employee counts)."
+        )
+        if df.empty:
+            st.info("No matching contractors found.")
+        else:
+            st.dataframe(
+                df.drop(columns=["contractor_id"]),
+                use_container_width=True,
+                hide_index=True,
+                height=540,
+                column_config={
+                    "contractor_name": "Contractor",
+                    "approx_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
+                    "az_roc_license": "AZ ROC License",
+                    "projects_awarded": st.column_config.NumberColumn("Projects Awarded", format="%d"),
+                    "awarded_volume": st.column_config.NumberColumn("Awarded Volume", format="$%,.0f"),
+                    "itemized_bids": st.column_config.NumberColumn("Itemized Bids", format="%d"),
+                    "itemized_wins": st.column_config.NumberColumn("Itemized Wins", format="%d"),
+                    "bid_line_count": st.column_config.NumberColumn("Bid Lines", format="%,d"),
+                },
+            )
+            st.download_button(
+                "Download Contractors CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="az_bidtabs_contractors.csv",
+                mime="text/csv",
+            )
+
+    elif detail_key == "pay_items":
+        f1, f2 = st.columns([2.5, 1.0])
+        q = f1.text_input(
+            "Search Item Code or Description",
+            key="pay_items_search",
+            placeholder="e.g. 2030301, ASPHALT, CURB, EXCAVATION...",
+        )
+        spec = f2.selectbox("Spec System", ["ALL", "ADOT", "MAG"], key="pay_items_spec")
+        df = get_all_pay_items(DB_PATH, spec_system=spec, search=q)
+
+        m1, m2 = st.columns(2)
+        m1.metric("Matching Pay Items", f"{len(df):,}")
+        m2.metric(
+            "Total Contractor Observations",
+            f"{int(df['observations'].sum()):,}" if not df.empty else "0",
+        )
+        if df.empty:
+            st.info("No matching pay items found.")
+        else:
+            st.caption("Tip: Click any **Item Code** to view all contractor bids for that item.")
+            st.dataframe(
+                _with_clickable_item_links(df.drop(columns=["item_id"]), "item_code", "spec_system"),
+                use_container_width=True,
+                hide_index=True,
+                height=540,
+                column_config={
+                    "spec_system": "Spec",
+                    "item_code": st.column_config.LinkColumn(
+                        "Item Code",
+                        help="Open all-contractor pricing details for this item code",
+                        display_text=_ITEM_LINK_DISPLAY_RE,
+                    ),
+                    "description": "Description",
+                    "unit": "Unit",
+                    "category": "Category",
+                    "observations": st.column_config.NumberColumn("Observations", format="%d"),
+                    "avg_unit_price": st.column_config.NumberColumn("Avg Unit Price", format="$%,.2f"),
+                    "min_unit_price": st.column_config.NumberColumn("Min Unit Price", format="$%,.2f"),
+                    "max_unit_price": st.column_config.NumberColumn("Max Unit Price", format="$%,.2f"),
+                },
+            )
+            st.download_button(
+                "Download Pay Items CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="az_bidtabs_pay_items.csv",
+                mime="text/csv",
+            )
 
 
 def _render_item_detail_page(item_code: str, initial_spec: str = "ALL") -> None:
@@ -443,62 +675,92 @@ if qp_item:
 # Page 1: Market Overview
 # ---------------------------------------------------------------------------
 elif page == "Market Overview":
-    st.title("Arizona Heavy-Civil Market Overview")
-    st.caption(
-        "Unified bid tabulation archive across **ADOT** and **Municipal / MAG** agencies "
-        "(Phoenix, Mesa, Scottsdale, Chandler, Goodyear, MCDOT, Pima County)."
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Projects Archived", f"{stats['projects']:,}")
-    c2.metric("Contractors Tracked", f"{stats['contractors']:,}")
-    c3.metric("Unique Pay Items", f"{stats['pay_items']:,}")
-    c4.metric("Awarded Volume", f"${stats['total_awarded_volume'] / 1e6:,.1f}M")
-
-    if stats["projects"] == 0:
-        st.info(
-            "Database is empty (Production Mode). Go to **Ingestion & Scrapers → Batch Upload (Multi-File)** "
-            "to import ADOT Bid Tab PDFs or City of Phoenix / MCDOT CSV/XLSX exports."
+    active_detail = st.session_state.get("overview_detail")
+    if active_detail in ("projects", "contractors", "pay_items", "awarded"):
+        _render_overview_detail_page(active_detail, stats)
+    else:
+        st.title("Arizona Heavy-Civil Market Overview")
+        st.caption(
+            "Unified bid tabulation archive across **ADOT** and **Municipal / MAG** agencies "
+            "(Phoenix, Mesa, Scottsdale, Chandler, Goodyear, MCDOT, Pima County). "
+            "Tap any summary card below to inspect all records."
         )
 
-    col_left, col_right = st.columns([1.2, 1.8])
-    with col_left:
-        st.subheader("Coverage by Agency")
-        ag_df = stats["agencies_df"]
-        if not ag_df.empty:
-            fig = px.bar(
-                ag_df,
-                x="projects",
-                y="agency",
-                orientation="h",
-                color="awarded_volume",
-                color_continuous_scale="YlOrBr",
-                labels={"projects": "Projects", "agency": "Agency", "awarded_volume": "Awarded ($)"},
-            )
-            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
-
-    with col_right:
-        st.subheader("Recent Bid Lettings")
-        rec_df = stats["recent_projects_df"]
-        if not rec_df.empty:
-            st.dataframe(
-                rec_df,
+        with st.container(key="overview_kpi_cards"):
+            c1, c2, c3, c4 = st.columns(4)
+            if c1.button(
+                f"Projects Archived  \n### {stats['projects']:,}  \n:small[View all projects →]",
+                key="kpi_projects",
                 use_container_width=True,
-                hide_index=True,
-                height=340,
-                column_config={
-                    "engineers_estimate": st.column_config.NumberColumn(
-                        "Engineer's Estimate", format="$%,.0f"
-                    ),
-                    "winning_bid_total": st.column_config.NumberColumn(
-                        "Winning Bid Total", format="$%,.0f"
-                    ),
-                    "contractor_employees": st.column_config.NumberColumn(
-                        "Approx. Employees", format="%,d"
-                    ),
-                },
+            ):
+                st.session_state["overview_detail"] = "projects"
+                st.rerun()
+            if c2.button(
+                f"Contractors Tracked  \n### {stats['contractors']:,}  \n:small[View all companies →]",
+                key="kpi_contractors",
+                use_container_width=True,
+            ):
+                st.session_state["overview_detail"] = "contractors"
+                st.rerun()
+            if c3.button(
+                f"Unique Pay Items  \n### {stats['pay_items']:,}  \n:small[View pay item catalog →]",
+                key="kpi_pay_items",
+                use_container_width=True,
+            ):
+                st.session_state["overview_detail"] = "pay_items"
+                st.rerun()
+            if c4.button(
+                f"Awarded Volume  \n### ${stats['total_awarded_volume'] / 1e6:,.1f}M  \n:small[View awarded contracts →]",
+                key="kpi_awarded",
+                use_container_width=True,
+            ):
+                st.session_state["overview_detail"] = "awarded"
+                st.rerun()
+
+        if stats["projects"] == 0:
+            st.info(
+                "Database is empty (Production Mode). Go to **Ingestion & Scrapers → Batch Upload (Multi-File)** "
+                "to import ADOT Bid Tab PDFs or City of Phoenix / MCDOT CSV/XLSX exports."
             )
+
+        col_left, col_right = st.columns([1.2, 1.8])
+        with col_left:
+            st.subheader("Coverage by Agency")
+            ag_df = stats["agencies_df"]
+            if not ag_df.empty:
+                fig = px.bar(
+                    ag_df,
+                    x="projects",
+                    y="agency",
+                    orientation="h",
+                    color="awarded_volume",
+                    color_continuous_scale="YlOrBr",
+                    labels={"projects": "Projects", "agency": "Agency", "awarded_volume": "Awarded ($)"},
+                )
+                fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis={"categoryorder": "total ascending"})
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col_right:
+            st.subheader("Recent Bid Lettings")
+            rec_df = stats["recent_projects_df"]
+            if not rec_df.empty:
+                st.dataframe(
+                    rec_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=340,
+                    column_config={
+                        "engineers_estimate": st.column_config.NumberColumn(
+                            "Engineer's Estimate", format="$%,.0f"
+                        ),
+                        "winning_bid_total": st.column_config.NumberColumn(
+                            "Winning Bid Total", format="$%,.0f"
+                        ),
+                        "contractor_employees": st.column_config.NumberColumn(
+                            "Approx. Employees", format="%,d"
+                        ),
+                    },
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +933,11 @@ elif page == "Pay Item Explorer":
 # ---------------------------------------------------------------------------
 elif page == "Competitor Intel & Head-to-Head":
     st.title("Competitor Intel & Head-to-Head")
-    st.caption("Track contractor win rates, aggressiveness vs. Engineer's Estimate, and line-item head-to-head pricing.")
+    st.caption(
+        "Track contractor win rates, aggressiveness vs. Engineer's Estimate, and line-item head-to-head pricing. "
+        "Approx. Employees are estimated from public corporate disclosures and industry directories "
+        "(AZ Dept. of Revenue and AZ ROC do not publish employee counts)."
+    )
 
     scorecard = get_contractor_scorecard(DB_PATH)
     st.subheader("Contractor Scorecard")

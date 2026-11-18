@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.contractor_profiles import backfill_contractor_profiles
 from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.bonfire import run_all_bonfire_syncs
@@ -71,6 +72,12 @@ def main() -> int:
         report["chandler"] = run_chandler_sync(args.db, limit=args.limit, dry_run=args.dry_run)
     except Exception as exc:
         report["chandler"] = {"error": str(exc)}
+
+    if not args.dry_run:
+        try:
+            report["contractors_enriched"] = backfill_contractor_profiles(args.db)
+        except Exception as exc:
+            report["contractors_enriched"] = {"error": str(exc)}
 
     print(json.dumps(report, indent=2))
     return 0

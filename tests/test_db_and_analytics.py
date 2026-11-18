@@ -283,5 +283,113 @@ def test_get_head_to_head_opponents_filters_non_overlapping(tmp_path: Path):
     assert "DELTA SOLO" not in opponents
 
 
+def test_contractor_profile_enrichment_and_backfill(tmp_path: Path):
+    from src.contractor_profiles import backfill_contractor_profiles, lookup_contractor_profile
+    from src.db import db_session, init_db, upsert_contractor
+
+    assert lookup_contractor_profile("FANN CONTRACTING")[1] == 250
+    assert lookup_contractor_profile("CACTUS ASPHALT A DIVISION OF CACTUS TRANSPORT")[1] == 120
+    assert lookup_contractor_profile("UNKNOWN SOLO CONTRACTOR") == (None, None)
+
+    db_path = tmp_path / "enrich.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        # Simulate pre-existing legacy row with NULL approx_employees
+        conn.execute(
+            "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
+            ("NESBITT CONTRACTING", None, None),
+        )
+        # New upsert automatically populates profile estimate
+        cid_new = upsert_contractor(conn, "Pulice Construction, Inc.")
+        emp_new = conn.execute(
+            "SELECT approx_employees FROM contractors WHERE contractor_id = ?",
+            (cid_new,),
+        ).fetchone()[0]
+    assert emp_new == 350
+
+    updated = backfill_contractor_profiles(db_path)
+    assert updated == 1
+    with db_session(db_path) as conn:
+        emp_backfilled = conn.execute(
+            "SELECT approx_employees FROM contractors WHERE canonical_name = 'NESBITT CONTRACTING'"
+        ).fetchone()[0]
+    assert emp_backfilled == 200
+
+
+def test_overview_directory_queries(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_all_contractors,
+        get_all_pay_items,
+        get_all_projects,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+    )
+
+    db_path = tmp_path / "directories.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        cid_a = upsert_contractor(conn, "Ames Construction, Inc.")
+        cid_b = upsert_contractor(conn, "City Vendor Only LLC")
+        p1 = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F001",
+            title="I-10 Widening",
+            county="Maricopa",
+            letting_date="2026-09-01",
+            winning_bid_total=2500000.0,
+            awarded_contractor_id=cid_a,
+        )
+        upsert_project(
+            conn,
+            agency="City of Mesa",
+            agency_project_num="M001",
+            title="Mesa Waterline Metadata",
+            county="Maricopa",
+            letting_date="2026-10-01",
+            awarded_contractor_id=cid_b,
+        )
+        item_adot = upsert_pay_item(conn, "ADOT", "2030301", "ROADWAY EXCAVATION", "CU.YD.")
+        upsert_pay_item(conn, "MAG", "321-1", "ASPHALT PAVEMENT", "TON")
+        insert_bid_line(
+            conn,
+            project_id=p1,
+            contractor_id=cid_a,
+            is_engineers_estimate=False,
+            item_id=item_adot,
+            quantity=1000.0,
+            unit_price=22.5,
+            bid_rank=1,
+            is_winner=True,
+        )
+
+    all_projs = get_all_projects(db_path)
+    assert len(all_projs) == 2
+    awarded_projs = get_all_projects(db_path, awarded_only=True)
+    assert len(awarded_projs) == 1
+    assert awarded_projs.iloc[0]["agency_project_num"] == "F001"
+
+    all_contractors = get_all_contractors(db_path)
+    assert len(all_contractors) == 2
+    assert set(all_contractors["contractor_name"]) == {"AMES CONSTRUCTION", "CITY VENDOR ONLY"}
+    ames_row = all_contractors[all_contractors["contractor_name"] == "AMES CONSTRUCTION"].iloc[0]
+    assert int(ames_row["approx_employees"]) == 1500
+    assert int(ames_row["projects_awarded"]) == 1
+
+    all_items = get_all_pay_items(db_path)
+    assert len(all_items) == 2
+    mag_items = get_all_pay_items(db_path, spec_system="MAG")
+    assert len(mag_items) == 1
+    assert mag_items.iloc[0]["item_code"] == "321-1"
+
+
+
+
 
 

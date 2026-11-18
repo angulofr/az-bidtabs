@@ -308,6 +308,14 @@ def upsert_contractor(
     canonical = normalize_contractor_name(raw_name)
     if not canonical:
         raise ValueError("Contractor name cannot be empty.")
+    if az_roc_license is None or approx_employees is None:
+        from src.contractor_profiles import lookup_contractor_profile
+
+        prof_roc, prof_emp = lookup_contractor_profile(canonical)
+        if az_roc_license is None:
+            az_roc_license = prof_roc
+        if approx_employees is None:
+            approx_employees = prof_emp
     row = conn.execute(
         "SELECT contractor_id, az_roc_license, approx_employees FROM contractors WHERE canonical_name = ?",
         (canonical,),
@@ -941,4 +949,187 @@ def get_head_to_head(
             if col in line_df.columns:
                 line_df[col] = pd.to_numeric(line_df[col], errors="coerce")
         return proj_df, line_df
+
+
+def get_all_projects(
+    db_path: Path | str | None = None,
+    *,
+    agency: str = "ALL",
+    county: str = "ALL",
+    search: str = "",
+    awarded_only: bool = False,
+) -> pd.DataFrame:
+    """Return archived projects with awarded contractor & line-item counts."""
+    sql = """
+        WITH line_counts AS (
+            SELECT project_id, COUNT(*) AS bid_line_count
+            FROM bid_lines
+            GROUP BY project_id
+        )
+        SELECT
+            p.project_id,
+            p.agency,
+            p.agency_project_num,
+            p.title,
+            p.county,
+            p.letting_date,
+            p.engineers_estimate,
+            p.winning_bid_total,
+            c.canonical_name AS awarded_contractor,
+            c.approx_employees AS contractor_employees,
+            COALESCE(lc.bid_line_count, 0) AS bid_line_count,
+            p.source_url
+        FROM projects p
+        LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
+        LEFT JOIN line_counts lc ON p.project_id = lc.project_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if agency and agency != "ALL":
+        sql += " AND p.agency = ?"
+        params.append(agency)
+    if county and county != "ALL":
+        sql += " AND p.county = ?"
+        params.append(county)
+    if awarded_only:
+        sql += " AND COALESCE(p.winning_bid_total, 0) > 0"
+    if search.strip():
+        q = f"%{search.strip()}%"
+        sql += (
+            " AND (UPPER(p.agency_project_num) LIKE UPPER(?)"
+            " OR UPPER(p.title) LIKE UPPER(?)"
+            " OR UPPER(COALESCE(c.canonical_name, '')) LIKE UPPER(?))"
+        )
+        params.extend([q, q, q])
+
+    if awarded_only:
+        sql += " ORDER BY COALESCE(p.winning_bid_total, 0) DESC, p.letting_date DESC"
+    else:
+        sql += (
+            " ORDER BY CASE WHEN p.letting_date IS NULL OR p.letting_date = '' THEN 1 ELSE 0 END,"
+            " p.letting_date DESC, p.project_id DESC"
+        )
+
+    with db_session(db_path) as conn:
+        df = conn.query_df(sql, params)
+    for col in ["engineers_estimate", "winning_bid_total", "contractor_employees", "bid_line_count"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def get_all_contractors(
+    db_path: Path | str | None = None,
+    *,
+    search: str = "",
+) -> pd.DataFrame:
+    """Return all tracked contractors (both awarded-project owners and itemized bidders)."""
+    sql = """
+        WITH awarded_stats AS (
+            SELECT
+                awarded_contractor_id AS contractor_id,
+                COUNT(*) AS projects_awarded,
+                COALESCE(SUM(winning_bid_total), 0) AS awarded_project_volume
+            FROM projects
+            WHERE awarded_contractor_id IS NOT NULL
+            GROUP BY awarded_contractor_id
+        ),
+        bid_stats AS (
+            SELECT
+                contractor_id,
+                COUNT(DISTINCT project_id) AS itemized_bids,
+                COUNT(DISTINCT CASE WHEN is_winner = 1 THEN project_id END) AS itemized_wins,
+                COUNT(*) AS bid_line_count
+            FROM bid_lines
+            WHERE is_engineers_estimate = 0 AND contractor_id IS NOT NULL
+            GROUP BY contractor_id
+        )
+        SELECT
+            c.contractor_id,
+            c.canonical_name AS contractor_name,
+            c.approx_employees,
+            COALESCE(c.az_roc_license, '—') AS az_roc_license,
+            COALESCE(a.projects_awarded, 0) AS projects_awarded,
+            COALESCE(a.awarded_project_volume, 0) AS awarded_volume,
+            COALESCE(b.itemized_bids, 0) AS itemized_bids,
+            COALESCE(b.itemized_wins, 0) AS itemized_wins,
+            COALESCE(b.bid_line_count, 0) AS bid_line_count
+        FROM contractors c
+        LEFT JOIN awarded_stats a ON c.contractor_id = a.contractor_id
+        LEFT JOIN bid_stats b ON c.contractor_id = b.contractor_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if search.strip():
+        q = f"%{search.strip()}%"
+        sql += " AND UPPER(c.canonical_name) LIKE UPPER(?)"
+        params.append(q)
+
+    sql += " ORDER BY projects_awarded DESC, itemized_bids DESC, c.canonical_name ASC"
+    with db_session(db_path) as conn:
+        df = conn.query_df(sql, params)
+    for col in [
+        "approx_employees",
+        "projects_awarded",
+        "awarded_volume",
+        "itemized_bids",
+        "itemized_wins",
+        "bid_line_count",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def get_all_pay_items(
+    db_path: Path | str | None = None,
+    *,
+    spec_system: str = "ALL",
+    search: str = "",
+) -> pd.DataFrame:
+    """Return all unique pay items with observation counts and unit-price ranges."""
+    sql = """
+        WITH item_stats AS (
+            SELECT
+                item_id,
+                COUNT(*) AS observations,
+                CAST(ROUND(CAST(AVG(unit_price) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_unit_price,
+                MIN(unit_price) AS min_unit_price,
+                MAX(unit_price) AS max_unit_price
+            FROM bid_lines
+            WHERE is_engineers_estimate = 0
+            GROUP BY item_id
+        )
+        SELECT
+            pi.item_id,
+            pi.spec_system,
+            pi.item_code,
+            pi.description,
+            pi.unit,
+            COALESCE(pi.category, '') AS category,
+            COALESCE(s.observations, 0) AS observations,
+            s.avg_unit_price,
+            s.min_unit_price,
+            s.max_unit_price
+        FROM pay_items pi
+        LEFT JOIN item_stats s ON pi.item_id = s.item_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if spec_system in ("ADOT", "MAG"):
+        sql += " AND pi.spec_system = ?"
+        params.append(spec_system)
+    if search.strip():
+        q = f"%{search.strip()}%"
+        sql += " AND (UPPER(pi.item_code) LIKE UPPER(?) OR UPPER(pi.description) LIKE UPPER(?))"
+        params.extend([q, q])
+
+    sql += " ORDER BY observations DESC, pi.spec_system ASC, pi.item_code ASC"
+    with db_session(db_path) as conn:
+        df = conn.query_df(sql, params)
+    for col in ["observations", "avg_unit_price", "min_unit_price", "max_unit_price"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
 
