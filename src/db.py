@@ -1133,3 +1133,188 @@ def get_all_pay_items(
     return df
 
 
+def get_contractor_details(
+    contractor_name: str,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return full profile, won projects, submitted bids, agency breakdown, and top items."""
+    canonical = normalize_contractor_name(contractor_name) or contractor_name.strip().upper()
+    with db_session(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT contractor_id, canonical_name, az_roc_license, approx_employees
+            FROM contractors
+            WHERE canonical_name = ?
+            """,
+            (canonical,),
+        ).fetchone()
+        if not row:
+            return {
+                "contractor": None,
+                "summary": {},
+                "won_projects_df": pd.DataFrame(),
+                "all_bids_df": pd.DataFrame(),
+                "agency_breakdown_df": pd.DataFrame(),
+                "top_items_df": pd.DataFrame(),
+            }
+
+        cid = int(row[0])
+        contractor_info = {
+            "contractor_id": cid,
+            "contractor_name": str(row[1]),
+            "az_roc_license": row[2],
+            "approx_employees": int(row[3]) if row[3] is not None else None,
+        }
+
+        won_sql = """
+            WITH line_winners AS (
+                SELECT
+                    project_id,
+                    SUM(extended_total) AS bidder_total,
+                    COUNT(*) AS line_count
+                FROM bid_lines
+                WHERE contractor_id = ?
+                  AND is_engineers_estimate = 0
+                  AND is_winner = 1
+                GROUP BY project_id
+            ),
+            all_lines AS (
+                SELECT project_id, COUNT(*) AS line_count
+                FROM bid_lines
+                WHERE contractor_id = ? AND is_engineers_estimate = 0
+                GROUP BY project_id
+            )
+            SELECT
+                p.project_id,
+                p.agency,
+                p.agency_project_num,
+                p.title,
+                p.county,
+                p.letting_date,
+                p.engineers_estimate,
+                COALESCE(p.winning_bid_total, lw.bidder_total) AS winning_bid_total,
+                COALESCE(al.line_count, 0) AS bid_line_count,
+                p.source_url
+            FROM projects p
+            LEFT JOIN line_winners lw ON p.project_id = lw.project_id
+            LEFT JOIN all_lines al ON p.project_id = al.project_id
+            WHERE p.awarded_contractor_id = ? OR lw.project_id IS NOT NULL
+            ORDER BY CASE WHEN p.letting_date IS NULL OR p.letting_date = '' THEN 1 ELSE 0 END,
+                     p.letting_date DESC, p.project_id DESC
+        """
+        won_df = conn.query_df(won_sql, [cid, cid, cid])
+
+        bids_sql = """
+            SELECT
+                p.project_id,
+                p.agency,
+                p.agency_project_num,
+                p.title,
+                p.county,
+                p.letting_date,
+                p.engineers_estimate,
+                SUM(bl.extended_total) AS bidder_total,
+                CAST(ROUND(CAST(CASE WHEN p.engineers_estimate > 0
+                    THEN 100.0 * (SUM(bl.extended_total) - p.engineers_estimate) / p.engineers_estimate
+                    ELSE NULL END AS NUMERIC), 2) AS DOUBLE PRECISION) AS pct_vs_ee,
+                MIN(bl.bid_rank) AS bid_rank,
+                MAX(bl.is_winner) AS is_winner,
+                COUNT(*) AS bid_line_count,
+                p.source_url
+            FROM bid_lines bl
+            JOIN projects p ON bl.project_id = p.project_id
+            WHERE bl.contractor_id = ? AND bl.is_engineers_estimate = 0
+            GROUP BY p.project_id, p.agency, p.agency_project_num, p.title, p.county,
+                     p.letting_date, p.engineers_estimate, p.source_url
+            ORDER BY CASE WHEN p.letting_date IS NULL OR p.letting_date = '' THEN 1 ELSE 0 END,
+                     p.letting_date DESC, p.project_id DESC
+        """
+        bids_df = conn.query_df(bids_sql, [cid])
+
+        items_sql = """
+            SELECT
+                pi.spec_system,
+                pi.item_code,
+                pi.description,
+                pi.unit,
+                COUNT(*) AS times_bid,
+                CAST(ROUND(CAST(AVG(bl.unit_price) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_unit_price,
+                CAST(ROUND(CAST(SUM(bl.extended_total) AS NUMERIC), 2) AS DOUBLE PRECISION) AS total_extended
+            FROM bid_lines bl
+            JOIN pay_items pi ON bl.item_id = pi.item_id
+            WHERE bl.contractor_id = ? AND bl.is_engineers_estimate = 0
+            GROUP BY pi.item_id, pi.spec_system, pi.item_code, pi.description, pi.unit
+            ORDER BY total_extended DESC, times_bid DESC
+            LIMIT 100
+        """
+        items_df = conn.query_df(items_sql, [cid])
+
+    for col in ["engineers_estimate", "winning_bid_total", "bid_line_count"]:
+        if col in won_df.columns:
+            won_df[col] = pd.to_numeric(won_df[col], errors="coerce")
+    for col in ["engineers_estimate", "bidder_total", "pct_vs_ee", "bid_rank", "is_winner", "bid_line_count"]:
+        if col in bids_df.columns:
+            bids_df[col] = pd.to_numeric(bids_df[col], errors="coerce")
+    for col in ["times_bid", "avg_unit_price", "total_extended"]:
+        if col in items_df.columns:
+            items_df[col] = pd.to_numeric(items_df[col], errors="coerce")
+
+    # Agency summary combining awarded wins and itemized bids
+    agency_rows: dict[str, dict[str, Any]] = {}
+    if not won_df.empty:
+        for ag, grp in won_df.groupby("agency"):
+            agency_rows[str(ag)] = {
+                "agency": str(ag),
+                "projects_won": int(len(grp)),
+                "won_volume": float(grp["winning_bid_total"].fillna(0).sum()),
+                "bids_submitted": 0,
+                "bid_volume": 0.0,
+            }
+    if not bids_df.empty:
+        for ag, grp in bids_df.groupby("agency"):
+            entry = agency_rows.setdefault(
+                str(ag),
+                {
+                    "agency": str(ag),
+                    "projects_won": 0,
+                    "won_volume": 0.0,
+                    "bids_submitted": 0,
+                    "bid_volume": 0.0,
+                },
+            )
+            entry["bids_submitted"] = int(len(grp))
+            entry["bid_volume"] = float(grp["bidder_total"].fillna(0).sum())
+
+    agency_df = (
+        pd.DataFrame(list(agency_rows.values())).sort_values(
+            ["projects_won", "bids_submitted", "won_volume"], ascending=False
+        )
+        if agency_rows
+        else pd.DataFrame()
+    )
+
+    total_bids = int(len(bids_df))
+    itemized_wins = int((bids_df["is_winner"] == 1).sum()) if not bids_df.empty else 0
+    win_rate = round(100.0 * itemized_wins / total_bids, 1) if total_bids > 0 else None
+    ee_series = bids_df["pct_vs_ee"].dropna() if not bids_df.empty else pd.Series(dtype=float)
+
+    summary = {
+        "projects_won": int(len(won_df)),
+        "total_won_volume": float(won_df["winning_bid_total"].fillna(0).sum()) if not won_df.empty else 0.0,
+        "total_bids_submitted": total_bids,
+        "total_bid_volume": float(bids_df["bidder_total"].fillna(0).sum()) if not bids_df.empty else 0.0,
+        "win_rate_pct": win_rate,
+        "avg_pct_vs_ee": round(float(ee_series.mean()), 2) if not ee_series.empty else None,
+        "agencies_count": int(len(agency_rows)),
+    }
+    return {
+        "contractor": contractor_info,
+        "summary": summary,
+        "won_projects_df": won_df,
+        "all_bids_df": bids_df,
+        "agency_breakdown_df": agency_df,
+        "top_items_df": items_df,
+    }
+
+
+

@@ -284,36 +284,46 @@ def test_get_head_to_head_opponents_filters_non_overlapping(tmp_path: Path):
 
 
 def test_contractor_profile_enrichment_and_backfill(tmp_path: Path):
-    from src.contractor_profiles import backfill_contractor_profiles, lookup_contractor_profile
+    from src.contractor_profiles import (
+        backfill_contractor_profiles,
+        get_contractor_metadata,
+        lookup_contractor_profile,
+    )
     from src.db import db_session, init_db, upsert_contractor
 
-    assert lookup_contractor_profile("FANN CONTRACTING")[1] == 250
-    assert lookup_contractor_profile("CACTUS ASPHALT A DIVISION OF CACTUS TRANSPORT")[1] == 120
+    assert lookup_contractor_profile("FANN CONTRACTING") == ("ROC071520", 250)
+    assert lookup_contractor_profile("CACTUS ASPHALT A DIVISION OF CACTUS TRANSPORT") == ("ROC194430", 120)
     assert lookup_contractor_profile("UNKNOWN SOLO CONTRACTOR") == (None, None)
+    meta = get_contractor_metadata("FANN CONTRACTING")
+    assert meta["hq_location"] == "Prescott, AZ"
+    assert meta["website"] == "https://fanncontracting.com"
+    assert meta["specialty"]
 
     db_path = tmp_path / "enrich.db"
     init_db(db_path)
 
     with db_session(db_path) as conn:
-        # Simulate pre-existing legacy row with NULL approx_employees
+        # Simulate pre-existing legacy row with NULL approx_employees and az_roc_license
         conn.execute(
             "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
             ("NESBITT CONTRACTING", None, None),
         )
-        # New upsert automatically populates profile estimate
+        # New upsert automatically populates profile estimate + ROC
         cid_new = upsert_contractor(conn, "Pulice Construction, Inc.")
-        emp_new = conn.execute(
-            "SELECT approx_employees FROM contractors WHERE contractor_id = ?",
+        roc_new, emp_new = conn.execute(
+            "SELECT az_roc_license, approx_employees FROM contractors WHERE contractor_id = ?",
             (cid_new,),
-        ).fetchone()[0]
+        ).fetchone()
+    assert roc_new == "ROC071463"
     assert emp_new == 350
 
     updated = backfill_contractor_profiles(db_path)
     assert updated == 1
     with db_session(db_path) as conn:
-        emp_backfilled = conn.execute(
-            "SELECT approx_employees FROM contractors WHERE canonical_name = 'NESBITT CONTRACTING'"
-        ).fetchone()[0]
+        roc_bf, emp_backfilled = conn.execute(
+            "SELECT az_roc_license, approx_employees FROM contractors WHERE canonical_name = 'NESBITT CONTRACTING'"
+        ).fetchone()
+    assert roc_bf == "ROC074063"
     assert emp_backfilled == 200
 
 
@@ -387,6 +397,91 @@ def test_overview_directory_queries(tmp_path: Path):
     mag_items = get_all_pay_items(db_path, spec_system="MAG")
     assert len(mag_items) == 1
     assert mag_items.iloc[0]["item_code"] == "321-1"
+
+
+def test_get_contractor_details_wins_and_bids(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_contractor_details,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+    )
+
+    db_path = tmp_path / "contractor_details.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        cid_a = upsert_contractor(conn, "Pulice Construction, Inc.")
+        cid_b = upsert_contractor(conn, "Fann Contracting, Inc.")
+        p_win_itemized = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F100",
+            title="Loop 101 Bridge",
+            county="Maricopa",
+            letting_date="2026-08-01",
+            engineers_estimate=100000.0,
+            winning_bid_total=90000.0,
+            awarded_contractor_id=cid_a,
+        )
+        p_loss = upsert_project(
+            conn,
+            agency="MCDOT",
+            agency_project_num="M200",
+            title="MCDOT Paving",
+            county="Maricopa",
+            letting_date="2026-09-01",
+            engineers_estimate=50000.0,
+            winning_bid_total=48000.0,
+            awarded_contractor_id=cid_b,
+        )
+        # Metadata-only Bonfire win (no bid_lines)
+        upsert_project(
+            conn,
+            agency="City of Scottsdale",
+            agency_project_num="S300",
+            title="Scottsdale Roadwork",
+            county="Maricopa",
+            letting_date="2026-10-01",
+            awarded_contractor_id=cid_a,
+        )
+        item_id = upsert_pay_item(conn, "ADOT", "2030301", "ROADWAY EXCAVATION", "CU.YD.")
+        insert_bid_line(
+            conn,
+            project_id=p_win_itemized,
+            contractor_id=cid_a,
+            is_engineers_estimate=False,
+            item_id=item_id,
+            quantity=1000.0,
+            unit_price=90.0,
+            bid_rank=1,
+            is_winner=True,
+        )
+        insert_bid_line(
+            conn,
+            project_id=p_loss,
+            contractor_id=cid_a,
+            is_engineers_estimate=False,
+            item_id=item_id,
+            quantity=1000.0,
+            unit_price=55.0,
+            bid_rank=2,
+            is_winner=False,
+        )
+
+    details = get_contractor_details("Pulice Construction, Inc.", db_path)
+    assert details["contractor"]["contractor_name"] == "PULICE CONSTRUCTION"
+    assert details["summary"]["projects_won"] == 2
+    assert details["summary"]["total_won_volume"] == 90000.0
+    assert details["summary"]["total_bids_submitted"] == 2
+    assert details["summary"]["win_rate_pct"] == 50.0
+    assert len(details["won_projects_df"]) == 2
+    assert len(details["all_bids_df"]) == 2
+    assert len(details["top_items_df"]) == 1
+
 
 
 
