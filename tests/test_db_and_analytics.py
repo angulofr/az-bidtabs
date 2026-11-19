@@ -576,7 +576,7 @@ def test_project_bids_summary_table_deduplication_and_details(tmp_path: Path):
         )
 
     all_c = get_all_contractors(db_path)
-    cs_row = all_c[all_c["contractor_name"] == "C S CONSTRUCTION"].iloc[0]
+    cs_row = all_c[all_c["contractor_name"] == "CS CONSTRUCTION"].iloc[0]
     std_row = all_c[all_c["contractor_name"] == "STANDARD CONSTRUCTION"].iloc[0]
     assert int(cs_row["itemized_bids"]) == 2
     assert int(cs_row["itemized_wins"]) == 2
@@ -584,11 +584,11 @@ def test_project_bids_summary_table_deduplication_and_details(tmp_path: Path):
     assert int(std_row["itemized_wins"]) == 0
 
     sc = get_contractor_scorecard(db_path)
-    sc_cs = sc[sc["contractor_name"] == "C S CONSTRUCTION"].iloc[0]
+    sc_cs = sc[sc["contractor_name"] == "CS CONSTRUCTION"].iloc[0]
     assert int(sc_cs["total_bids"]) == 2
     assert int(sc_cs["wins"]) == 2
 
-    det = get_contractor_details("C S CONSTRUCTION", db_path)
+    det = get_contractor_details("CS CONSTRUCTION", db_path)
     assert det["summary"]["total_bids_submitted"] == 2
     assert len(det["all_bids_df"]) == 2
     assert det["summary"]["total_won_volume"] == 1132972.60
@@ -706,6 +706,122 @@ def test_project_documents_and_get_project_details(tmp_path: Path):
     assert len(det["documents_df"]) == 1
     assert len(det["bidders_df"]) == 1
     assert len(det["lines_df"]) == 1
+
+
+def test_deduplicate_contractors_merges_markham_and_preserves_jvs(tmp_path: Path):
+    from src.db import (
+        db_session,
+        deduplicate_contractors,
+        get_contractor_details,
+        init_db,
+        upsert_project,
+        upsert_project_bid,
+    )
+
+    db_path = tmp_path / "dedup_test.db"
+    init_db(db_path)
+
+    # Seed pre-normalization duplicate rows directly into SQLite (mimicking existing production Postgres)
+    with db_session(db_path) as conn:
+        c_main = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
+            ("MARKHAM CONTRACTING", "ROC072454", 250),
+            "contractor_id",
+        )
+        c_bare = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("MARKHAM",),
+            "contractor_id",
+        )
+        c_addr1 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name, az_roc_license, approx_employees) VALUES (?, ?, ?)",
+            ("MARKHAM CONTRACTING CO INC ARIZONA", "ROC072454", 250),
+            "contractor_id",
+        )
+        c_addr2 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("MARKHAM CONTRACTING CO INC PHOENIX AZ",),
+            "contractor_id",
+        )
+        # Non-profile generic typo / abbreviation pair + JV guard + conflicting first-word guard
+        c_p1 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("ACME PAVING",),
+            "contractor_id",
+        )
+        c_p2 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("ACME PAVING SVCS",),
+            "contractor_id",
+        )
+        c_jv = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("SUNDT RUMMEL JOINT VENTURE",),
+            "contractor_id",
+        )
+        c_sundt = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("SUNDT CONSTRUCTION",),
+            "contractor_id",
+        )
+        c_smith1 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("MILLER",),
+            "contractor_id",
+        )
+        c_smith2 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("MILLER ELECTRIC",),
+            "contractor_id",
+        )
+        c_smith3 = conn.insert_returning_id(
+            "INSERT INTO contractors (canonical_name) VALUES (?)",
+            ("MILLER PIPELINE",),
+            "contractor_id",
+        )
+
+        p1 = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F0001",
+            title="Proj 1",
+            winning_bid_total=100000.0,
+            awarded_contractor_id=c_bare,
+        )
+        p2 = upsert_project(
+            conn,
+            agency="MCDOT",
+            agency_project_num="M0002",
+            title="Proj 2",
+            winning_bid_total=200000.0,
+            awarded_contractor_id=c_addr1,
+        )
+        # Same project bid under both c_main and c_addr2 -> must collapse without double-counting
+        upsert_project_bid(conn, project_id=p1, contractor_id=c_main, is_engineers_estimate=False, bid_total=100000.0, bid_rank=1, is_winner=True)
+        upsert_project_bid(conn, project_id=p1, contractor_id=c_addr2, is_engineers_estimate=False, bid_total=100000.0, bid_rank=1, is_winner=True)
+        upsert_project_bid(conn, project_id=p2, contractor_id=c_addr1, is_engineers_estimate=False, bid_total=200000.0, bid_rank=1, is_winner=True)
+
+    res = deduplicate_contractors(db_path)
+    assert res["duplicates_removed"] >= 3
+
+    with db_session(db_path) as conn:
+        names = [r[0] for r in conn.execute("SELECT canonical_name FROM contractors ORDER BY canonical_name").fetchall()]
+        pb_cnt = conn.execute("SELECT COUNT(*) FROM project_bids").fetchone()[0]
+
+    assert names.count("MARKHAM CONTRACTING") == 1
+    assert "MARKHAM" not in names
+    assert "MARKHAM CONTRACTING CO INC ARIZONA" not in names
+    assert "MARKHAM CONTRACTING CO INC PHOENIX AZ" not in names
+    assert "SUNDT RUMMEL JOINT VENTURE" in names
+    assert "SUNDT CONSTRUCTION" in names
+    # Ambiguous MILLER with ELECTRIC + PIPELINE must stay distinct
+    assert "MILLER" in names
+    assert pb_cnt == 2
+
+    det = get_contractor_details("MARKHAM CONTRACTING", db_path)
+    assert det["summary"]["projects_won"] == 2
+    assert det["summary"]["total_bids_submitted"] == 2
+    assert det["summary"]["total_won_volume"] == 300000.0
 
 
 

@@ -327,19 +327,58 @@ CONTRACTOR_PROFILES: dict[str, tuple[str | None, int | None]] = {
     k: (v.az_roc_license, v.approx_employees) for k, v in _PROFILES.items()
 }
 
+# Exact & typo aliases applied after normalize_contractor_name()
+_EXACT_ALIASES: dict[str, str] = {
+    "A J P ELECTRIC": "AJP ELECTRIC",
+    "AMES": "AMES CONSTRUCTION",
+    "B F CONTRACTING": "B AND F CONTRACTING",
+    "BANICKI": "J BANICKI CONSTRUCTION",
+    "J BANICKI": "J BANICKI CONSTRUCTION",
+    "JOHN BANICKI CONSTRUCTION": "J BANICKI CONSTRUCTION",
+    "BUE SING": "BUESING",
+    "CACTUS": "CACTUS ASPHALT",
+    "COMBS": "COMBS CONSTRUCTION",
+    "C S CONSTRUCTION": "CS CONSTRUCTION",
+    "D B A CONSTRUCTION": "DBA CONSTRUCTION",
+    "D C S CONTRACTING": "DCS CONTRACTING",
+    "FANN": "FANN CONTRACTING",
+    "FISHER": "FISHER SAND AND GRAVEL",
+    "FNF": "FNF CONSTRUCTION",
+    "GRANITE": "GRANITE CONSTRUCTION",
+    "HAYDON": "HAYDON COMPANIES",
+    "HUNTER": "HUNTER CONTRACTING",
+    "M G C CONTRACTORS": "MGC CONTRACTORS",
+    "M R TANNER": "M R TANNER DEVELOPMENT AND CONSTRUCTION",
+    "MR TANNER": "M R TANNER DEVELOPMENT AND CONSTRUCTION",
+    "MARKHAM": "MARKHAM CONTRACTING",
+    "NESBITT": "NESBITT CONTRACTING",
+    "NESBLTT": "NESBITT CONTRACTING",
+    "NESBLTT CONTRACTING": "NESBITT CONTRACTING",
+    "PULICE": "PULICE CONSTRUCTION",
+    "RUMMEL": "RUMMEL CONSTRUCTION",
+    "SEMA": "SEMA CONSTRUCTION",
+    "SUNDT": "SUNDT CONSTRUCTION",
+    "SUNLAND": "SUNLAND ASPHALT",
+    "T T CONSTRUCTION": "T AND T CONSTRUCTION",
+    "VIA SUN": "VIASUN",
+}
+
 # Prefix aliases for common corporate name variations / division suffixes
 _PREFIX_ALIASES: tuple[tuple[str, str], ...] = (
     ("ACHEN GARDNER", "ACHEN GARDNER CONSTRUCTION"),
     ("AECOM", "AECOM"),
+    ("AJP ELECTRIC", "AJP ELECTRIC"),
     ("AMES CONSTRUCTION", "AMES CONSTRUCTION"),
     ("ARCHER WESTERN", "ARCHER WESTERN CONSTRUCTION"),
     ("AZTEC ENGINEERING", "AZTEC ENGINEERING GROUP"),
     ("B AND F CONTRACTING", "B AND F CONTRACTING"),
+    ("B F CONTRACTING", "B AND F CONTRACTING"),
     ("BANICKI", "J BANICKI CONSTRUCTION"),
     ("J BANICKI", "J BANICKI CONSTRUCTION"),
     ("BLACK AND VEATCH", "BLACK AND VEATCH"),
     ("BLUCOR", "BLUCOR CONTRACTING"),
     ("BUESING", "BUESING"),
+    ("C S CONSTRUCTION", "CS CONSTRUCTION"),
     ("CACTUS ASPHALT", "CACTUS ASPHALT"),
     ("CACTUS TRANSPORT", "CACTUS ASPHALT"),
     ("CEMEX", "CEMEX"),
@@ -379,6 +418,7 @@ _PREFIX_ALIASES: tuple[tuple[str, str], ...] = (
     ("STANTEC", "STANTEC CONSULTING SERVICES"),
     ("SUNDT CONSTRUCTION", "SUNDT CONSTRUCTION"),
     ("SUNLAND ASPHALT", "SUNLAND ASPHALT"),
+    ("T AND T CONSTRUCTION", "T AND T CONSTRUCTION"),
     ("TEAM FISHEL", "TEAM FISHEL"),
     ("TRAFFICADE", "TRAFFICADE SIGNS AND SALES"),
     ("VIASUN", "VIASUN"),
@@ -388,14 +428,33 @@ _PREFIX_ALIASES: tuple[tuple[str, str], ...] = (
 )
 
 
+def canonicalize_contractor_name(raw_name: str) -> str:
+    """Normalize and unify a raw contractor name onto a single canonical entity name."""
+    from src.normalize import normalize_contractor_name
+
+    norm = normalize_contractor_name(raw_name)
+    if not norm:
+        return ""
+    tokens = norm.split()
+    is_jv = "JV" in tokens or ("JOINT" in tokens and "VENTURE" in tokens)
+    if norm in _EXACT_ALIASES:
+        return _EXACT_ALIASES[norm]
+    if is_jv:
+        return norm
+    for prefix, target in _PREFIX_ALIASES:
+        if norm == prefix or norm.startswith(prefix + " "):
+            return target
+    return norm
+
+
 def _resolve_profile(canonical_name: str) -> ContractorProfile | None:
-    key = (canonical_name or "").upper().strip()
+    key = canonicalize_contractor_name(canonical_name)
     if not key:
         return None
     if key in _PROFILES:
         return _PROFILES[key]
     for prefix, target in _PREFIX_ALIASES:
-        if key.startswith(prefix):
+        if key == prefix or key.startswith(prefix + " "):
             return _PROFILES[target]
     return None
 

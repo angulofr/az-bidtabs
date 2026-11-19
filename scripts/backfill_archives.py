@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.contractor_profiles import backfill_contractor_profiles
-from src.db import db_session, init_db
+from src.db import db_session, deduplicate_contractors, init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.adot_archive import (
     sync_adot_as_read_history,
@@ -181,6 +181,10 @@ def main() -> int:
         )
 
     if not args.dry_run:
+        report["steps"]["contractors_deduped"] = _run_step(
+            "contractors_deduped",
+            lambda: deduplicate_contractors(args.db),
+        )
         report["steps"]["contractors_enriched"] = _run_step(
             "contractors_enriched",
             lambda: backfill_contractor_profiles(args.db),

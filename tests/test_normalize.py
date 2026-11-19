@@ -1,3 +1,4 @@
+from src.contractor_profiles import canonicalize_contractor_name
 from src.normalize import normalize_contractor_name, normalize_item_code, normalize_unit
 
 
@@ -6,6 +7,11 @@ def test_normalize_contractor_name():
     assert normalize_contractor_name("Fisher Sand & Gravel Co., LLC") == "FISHER SAND AND GRAVEL"
     assert normalize_contractor_name("Achen-Gardner Construction, LLC") == "ACHEN GARDNER CONSTRUCTION"
     assert normalize_contractor_name("Combs Construction Company, Inc.") == "COMBS CONSTRUCTION"
+    assert normalize_contractor_name("MARKHAM CONTRACTING CO., INC. ARIZONA") == "MARKHAM CONTRACTING"
+    assert normalize_contractor_name("MARKHAM CONTRACTING CO INC PHOENIX, AZ") == "MARKHAM CONTRACTING"
+    assert canonicalize_contractor_name("Markham") == "MARKHAM CONTRACTING"
+    assert canonicalize_contractor_name("C S CONSTRUCTION, INC.") == "CS CONSTRUCTION"
+    assert canonicalize_contractor_name("Sundt / Rummel Joint Venture") == "SUNDT RUMMEL JOINT VENTURE"
 
 
 def test_normalize_unit():

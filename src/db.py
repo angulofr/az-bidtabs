@@ -367,12 +367,12 @@ def upsert_contractor(
     az_roc_license: str | None = None,
     approx_employees: int | None = None,
 ) -> int:
-    canonical = normalize_contractor_name(raw_name)
+    from src.contractor_profiles import canonicalize_contractor_name, lookup_contractor_profile
+
+    canonical = canonicalize_contractor_name(raw_name) or normalize_contractor_name(raw_name)
     if not canonical:
         raise ValueError("Contractor name cannot be empty.")
     if az_roc_license is None or approx_employees is None:
-        from src.contractor_profiles import lookup_contractor_profile
-
         prof_roc, prof_emp = lookup_contractor_profile(canonical)
         if az_roc_license is None:
             az_roc_license = prof_roc
@@ -1764,6 +1764,466 @@ def get_project_details(
         "documents_df": docs_df,
         "bidders_df": bidders_df,
         "lines_df": lines_df,
+    }
+
+
+_DEDUP_ABBREV_MAP: dict[str, str] = {
+    "CONST": "CONSTRUCTION",
+    "CONSTR": "CONSTRUCTION",
+    "CONSTRUCT": "CONSTRUCTION",
+    "CONSTRUCTN": "CONSTRUCTION",
+    "CONSTRUCTORS": "CONSTRUCTOR",
+    "CONTRACTORS": "CONTRACTOR",
+    "CONTR": "CONTRACTING",
+    "CONTRAC": "CONTRACTING",
+    "ENGR": "ENGINEERING",
+    "ENG": "ENGINEERING",
+    "ENGIN": "ENGINEERING",
+    "MAINT": "MAINTENANCE",
+    "DEV": "DEVELOPMENT",
+    "DEVEL": "DEVELOPMENT",
+    "ASSOC": "ASSOCIATES",
+    "SYS": "SYSTEMS",
+    "SVC": "SERVICES",
+    "SVCS": "SERVICES",
+    "SRVS": "SERVICES",
+    "ELECT": "ELECTRICAL",
+    "ELEC": "ELECTRICAL",
+    "IND": "INDUSTRIES",
+    "MATL": "MATERIALS",
+    "MATLS": "MATERIALS",
+    "PAV": "PAVING",
+    "UTIL": "UTILITIES",
+    "UTILS": "UTILITIES",
+    "EQUIP": "EQUIPMENT",
+    "MGMT": "MANAGEMENT",
+    "BROS": "BROTHERS",
+    "BUILDERS": "BUILDER",
+}
+
+_DEDUP_STOPWORDS = {"AND", "THE", "OF", "FOR", "A", "AN"}
+_DEDUP_TRAIL_GEO = {
+    "AZ",
+    "ARIZONA",
+    "PHOENIX",
+    "TUCSON",
+    "TEMPE",
+    "MESA",
+    "CHANDLER",
+    "GILBERT",
+    "GLENDALE",
+    "SCOTTSDALE",
+    "AVONDALE",
+    "PEORIA",
+    "PRESCOTT",
+    "FLAGSTAFF",
+    "YUMA",
+    "USA",
+}
+_GENERIC_FIRST_TOKENS = {
+    "ARIZONA",
+    "AMERICAN",
+    "WESTERN",
+    "SOUTHWEST",
+    "SUN",
+    "VALLEY",
+    "PHOENIX",
+    "NATIONAL",
+    "GENERAL",
+    "UNITED",
+    "STANDARD",
+    "PACIFIC",
+    "FIRST",
+    "NEW",
+    "PRECISION",
+    "TRI",
+    "ALL",
+    "CENTRAL",
+    "MOUNTAIN",
+    "DESERT",
+    "RED",
+    "BLUE",
+    "GOLD",
+    "SILVER",
+    "EAGLE",
+    "STAR",
+    "QUALITY",
+    "CUSTOM",
+    "PRO",
+    "ELITE",
+    "APEX",
+    "PREMIER",
+    "COPPER",
+    "SONORAN",
+    "CANYON",
+    "SUMMIT",
+    "SIERRA",
+    "LEGACY",
+    "STATE",
+    "CITY",
+    "TOWN",
+    "COUNTY",
+    "MARICOPA",
+    "PIMA",
+}
+_INDUSTRY_SUFFIX_WORDS = {
+    "CONSTRUCTION",
+    "CONTRACTING",
+    "CONTRACTOR",
+    "ASPHALT",
+    "PAVING",
+    "ELECTRIC",
+    "ELECTRICAL",
+    "EXCAVATING",
+    "EXCAVATION",
+    "UTILITY",
+    "UTILITIES",
+    "CONCRETE",
+    "ENGINEERING",
+    "MAINTENANCE",
+    "STRIPING",
+    "GRADING",
+    "DEVELOPMENT",
+    "ENTERPRISES",
+    "COMPANIES",
+    "GROUP",
+    "SERVICES",
+    "SYSTEMS",
+    "SUPPLY",
+    "MATERIALS",
+    "CIVIL",
+}
+
+
+def _contractor_signature_tokens(name: str) -> tuple[str, ...]:
+    """Build tightened comparison tokens (collapsed initials, normalized abbreviations, no stopwords/geo)."""
+    from src.contractor_profiles import canonicalize_contractor_name
+
+    canon = canonicalize_contractor_name(name)
+    raw_tokens = canon.split()
+    # Collapse adjacent single-letter initials: ["C", "S", "CONSTRUCTION"] -> ["CS", "CONSTRUCTION"]
+    merged: list[str] = []
+    i = 0
+    while i < len(raw_tokens):
+        if len(raw_tokens[i]) == 1 and raw_tokens[i].isalpha():
+            buf = raw_tokens[i]
+            j = i + 1
+            while j < len(raw_tokens) and len(raw_tokens[j]) == 1 and raw_tokens[j].isalpha():
+                buf += raw_tokens[j]
+                j += 1
+            merged.append(buf)
+            i = j
+        else:
+            merged.append(raw_tokens[i])
+            i += 1
+
+    out: list[str] = []
+    for idx, tok in enumerate(merged):
+        if tok in _DEDUP_STOPWORDS:
+            continue
+        if len(out) >= 1 and tok in _DEDUP_TRAIL_GEO and idx >= len(merged) - 2:
+            continue
+        out.append(_DEDUP_ABBREV_MAP.get(tok, tok))
+
+    if len(out) >= 2 and len(out[-1]) >= 6 and out[-1].endswith("S") and not out[-1].endswith("SS"):
+        singular = out[-1][:-1]
+        if singular in _DEDUP_ABBREV_MAP.values() or singular in _INDUSTRY_SUFFIX_WORDS:
+            out[-1] = singular
+
+    return tuple(out)
+
+
+def deduplicate_contractors(
+    db_path: Path | str | None = None,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Merge duplicate contractor rows across projects, bid_lines, and project_bids safely."""
+    from difflib import SequenceMatcher
+
+    from src.contractor_profiles import _PROFILES, canonicalize_contractor_name, lookup_contractor_profile
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT contractor_id, canonical_name, az_roc_license, approx_employees
+            FROM contractors
+            ORDER BY contractor_id ASC
+            """
+        ).fetchall()
+        if not rows:
+            return {"groups_merged": 0, "duplicates_removed": 0, "merges": []}
+
+        # Gather usage counts so we pick the highest-signal survivor row per cluster
+        ref_counts: dict[int, int] = {}
+        for sql in (
+            "SELECT awarded_contractor_id, COUNT(*) FROM projects WHERE awarded_contractor_id IS NOT NULL GROUP BY awarded_contractor_id",
+            "SELECT contractor_id, COUNT(*) FROM bid_lines WHERE contractor_id IS NOT NULL GROUP BY contractor_id",
+            "SELECT contractor_id, COUNT(*) FROM project_bids WHERE contractor_id IS NOT NULL GROUP BY contractor_id",
+        ):
+            for cid_raw, cnt in conn.execute(sql).fetchall():
+                cid = int(cid_raw)
+                ref_counts[cid] = ref_counts.get(cid, 0) + int(cnt)
+
+        records: dict[int, dict[str, Any]] = {}
+        for cid_raw, cname_raw, roc, emp in rows:
+            cid = int(cid_raw)
+            cname = str(cname_raw or "").strip()
+            upper = cname.upper()
+            if any(
+                upper.startswith(p)
+                for p in ("ADOT LOW BIDDER", "ADOT BIDDER", "DEPARTMENT", "UNKNOWN", "ENGINEER")
+            ):
+                continue
+            canon = canonicalize_contractor_name(cname) or cname
+            sig = _contractor_signature_tokens(canon)
+            is_jv = "JV" in canon.split() or ("JOINT" in canon.split() and "VENTURE" in canon.split())
+            records[cid] = {
+                "cid": cid,
+                "orig_name": cname,
+                "canon_name": canon,
+                "sig": sig,
+                "roc": (str(roc).strip().upper() if roc else None),
+                "emp": emp,
+                "is_jv": is_jv,
+                "refs": ref_counts.get(cid, 0),
+            }
+
+        cids = list(records.keys())
+        parent = {cid: cid for cid in cids}
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # Pass 1: exact canonicalize_contractor_name() match
+        by_canon: dict[str, list[int]] = {}
+        for cid, rec in records.items():
+            by_canon.setdefault(rec["canon_name"], []).append(cid)
+        for group_ids in by_canon.values():
+            for other in group_ids[1:]:
+                _union(group_ids[0], other)
+
+        # Pass 2: identical tightened signature tokens (non-JV or identical JV)
+        by_sig: dict[tuple[bool, tuple[str, ...]], list[int]] = {}
+        for cid, rec in records.items():
+            if rec["sig"]:
+                by_sig.setdefault((rec["is_jv"], rec["sig"]), []).append(cid)
+        for group_ids in by_sig.values():
+            for other in group_ids[1:]:
+                _union(group_ids[0], other)
+
+        # Pass 3: shared AZ ROC license + identical primary token (non-JV)
+        by_roc_first: dict[tuple[str, str], list[int]] = {}
+        for cid, rec in records.items():
+            if not rec["is_jv"] and rec["roc"] and rec["sig"]:
+                first = rec["sig"][0]
+                if len(first) >= 4 and first not in _GENERIC_FIRST_TOKENS:
+                    by_roc_first.setdefault((rec["roc"], first), []).append(cid)
+        for group_ids in by_roc_first.values():
+            for other in group_ids[1:]:
+                _union(group_ids[0], other)
+
+        # Pass 4: unambiguous strict prefix collapse on non-JV signature tokens
+        all_sigs_map: dict[tuple[str, ...], list[int]] = {}
+        for cid, rec in records.items():
+            if not rec["is_jv"] and rec["sig"]:
+                all_sigs_map.setdefault(rec["sig"], []).append(cid)
+
+        unique_sigs = sorted(all_sigs_map.keys(), key=len)
+        for sig in unique_sigs:
+            k = len(sig)
+            if k == 1 and (len(sig[0]) < 6 or sig[0] in _GENERIC_FIRST_TOKENS):
+                continue
+            extensions = [
+                ext
+                for ext in unique_sigs
+                if len(ext) > k and ext[:k] == sig
+            ]
+            if not extensions:
+                continue
+            # Check that extensions don't branch into conflicting second words when k == 1
+            if k == 1:
+                distinct_second_words = {ext[1] for ext in extensions}
+                # Only collapse single-word bare stems if every extension uses standard industry suffixes
+                # or all extensions agree on the exact same root 2nd word
+                if len(distinct_second_words) > 1 and not distinct_second_words.issubset(_INDUSTRY_SUFFIX_WORDS):
+                    continue
+                if len(distinct_second_words) == 1 and next(iter(distinct_second_words)) not in _INDUSTRY_SUFFIX_WORDS:
+                    continue
+                target_ext = sorted(extensions, key=lambda e: (len(e), e))[0]
+            else:
+                # k >= 2: e.g. ("MARKHAM", "CONTRACTING") vs ("MARKHAM", "CONTRACTING", "CO", ...)
+                target_ext = sig
+            base_cid = all_sigs_map[sig][0]
+            for ext in extensions:
+                # Merge extensions onto the same cluster only if unambiguous (single distinct 2-token root when k==1)
+                if k == 1 and len({e[:2] for e in extensions}) > 1 and ext[:2] != target_ext[:2]:
+                    continue
+                _union(base_cid, all_sigs_map[ext][0])
+
+        # Pass 5: single-token OCR/typo near-match sharing exact industry tail (e.g. NESBLTT vs NESBITT CONTRACTING)
+        by_tail: dict[str, list[int]] = {}
+        for cid, rec in records.items():
+            sig = rec["sig"]
+            if not rec["is_jv"] and len(sig) == 2 and sig[1] in _INDUSTRY_SUFFIX_WORDS and len(sig[0]) >= 6:
+                by_tail.setdefault(sig[1], []).append(cid)
+        for tail_cids in by_tail.values():
+            for idx_a in range(len(tail_cids)):
+                ca = tail_cids[idx_a]
+                w_a = records[ca]["sig"][0]
+                for idx_b in range(idx_a + 1, len(tail_cids)):
+                    cb = tail_cids[idx_b]
+                    w_b = records[cb]["sig"][0]
+                    if w_a[0] == w_b[0] and abs(len(w_a) - len(w_b)) <= 1:
+                        if SequenceMatcher(None, w_a, w_b).ratio() >= 0.85:
+                            _union(ca, cb)
+
+        # Group connected components
+        components: dict[int, list[int]] = {}
+        for cid in cids:
+            root = _find(cid)
+            components.setdefault(root, []).append(cid)
+
+        # Also check any single row whose canonical_name differs from canonicalize_contractor_name(orig_name)
+        merges_summary: list[dict[str, Any]] = []
+        removed_total = 0
+
+        for comp_cids in components.values():
+            # Choose canonical target name and best survivor ID
+            def _name_score(cid: int) -> tuple[int, int, int, int]:
+                rec = records[cid]
+                in_profiles = 0 if rec["canon_name"] in _PROFILES else 1
+                is_clean_canon = 0 if rec["orig_name"] == rec["canon_name"] else 1
+                sig_len = len(rec["sig"])
+                return (in_profiles, is_clean_canon, -rec["refs"], sig_len)
+
+            comp_sorted = sorted(comp_cids, key=lambda c: (_name_score(c), c))
+            best_cid = comp_sorted[0]
+            # Pick best canonical target name (prefer curated _PROFILES key, else cleanest rec["canon_name"])
+            target_name = records[best_cid]["canon_name"]
+            for cid in comp_sorted:
+                cn = records[cid]["canon_name"]
+                if cn in _PROFILES:
+                    target_name = cn
+                    break
+
+            # Pick actual DB survivor (if any other row already holds target_name, keep it!)
+            survivor_cid = best_cid
+            for cid in comp_sorted:
+                if records[cid]["orig_name"] == target_name:
+                    survivor_cid = cid
+                    break
+
+            dup_cids = [c for c in comp_cids if c != survivor_cid]
+            needs_rename = records[survivor_cid]["orig_name"] != target_name
+            if not dup_cids and not needs_rename:
+                continue
+
+            best_roc = next((records[c]["roc"] for c in comp_sorted if records[c]["roc"]), None)
+            best_emp = next((records[c]["emp"] for c in comp_sorted if records[c]["emp"] is not None), None)
+            prof_roc, prof_emp = lookup_contractor_profile(target_name)
+            best_roc = best_roc or prof_roc
+            best_emp = best_emp if best_emp is not None else prof_emp
+
+            merges_summary.append(
+                {
+                    "survivor_id": survivor_cid,
+                    "canonical_name": target_name,
+                    "merged_names": [records[c]["orig_name"] for c in comp_cids],
+                    "removed_count": len(dup_cids),
+                }
+            )
+            removed_total += len(dup_cids)
+
+            if dry_run:
+                continue
+
+            holder = conn.execute(
+                "SELECT contractor_id FROM contractors WHERE canonical_name = ? AND contractor_id != ?",
+                (target_name, survivor_cid),
+            ).fetchone()
+            if holder:
+                real_survivor = int(holder[0])
+                dup_cids.append(survivor_cid)
+                survivor_cid = real_survivor
+
+            if dup_cids:
+                placeholders = ",".join("?" for _ in [survivor_cid, *dup_cids])
+                # 1. Deduplicate project_bids on (project_id, is_engineers_estimate) across the group
+                pb_rows = conn.execute(
+                    f"""
+                    SELECT project_bid_id, project_id, contractor_id, is_engineers_estimate,
+                           bid_total, bid_rank, is_winner
+                    FROM project_bids
+                    WHERE contractor_id IN ({placeholders})
+                    ORDER BY is_winner DESC,
+                             CASE WHEN bid_rank IS NULL THEN 999 ELSE bid_rank END ASC,
+                             project_bid_id ASC
+                    """,
+                    [survivor_cid, *dup_cids],
+                ).fetchall()
+                seen_pb_keys: set[tuple[int, int]] = set()
+                keep_pb_ids: list[int] = []
+                del_pb_ids: list[int] = []
+                for pbid, pid_val, _, est_flag, _, _, _ in pb_rows:
+                    key = (int(pid_val), int(est_flag))
+                    if key in seen_pb_keys:
+                        del_pb_ids.append(int(pbid))
+                    else:
+                        seen_pb_keys.add(key)
+                        keep_pb_ids.append(int(pbid))
+                if del_pb_ids:
+                    del_ph = ",".join("?" for _ in del_pb_ids)
+                    conn.execute(f"DELETE FROM project_bids WHERE project_bid_id IN ({del_ph})", del_pb_ids)
+                if keep_pb_ids:
+                    keep_ph = ",".join("?" for _ in keep_pb_ids)
+                    conn.execute(
+                        f"UPDATE project_bids SET contractor_id = ? WHERE project_bid_id IN ({keep_ph})",
+                        [survivor_cid, *keep_pb_ids],
+                    )
+
+                dup_ph = ",".join("?" for _ in dup_cids)
+                conn.execute(
+                    f"UPDATE bid_lines SET contractor_id = ? WHERE contractor_id IN ({dup_ph})",
+                    [survivor_cid, *dup_cids],
+                )
+                conn.execute(
+                    f"UPDATE projects SET awarded_contractor_id = ? WHERE awarded_contractor_id IN ({dup_ph})",
+                    [survivor_cid, *dup_cids],
+                )
+                conn.execute(
+                    f"DELETE FROM contractors WHERE contractor_id IN ({dup_ph})",
+                    dup_cids,
+                )
+
+            conn.execute(
+                """
+                UPDATE contractors
+                SET canonical_name = ?,
+                    az_roc_license = COALESCE(?, az_roc_license),
+                    approx_employees = COALESCE(?, approx_employees)
+                WHERE contractor_id = ?
+                """,
+                (
+                    target_name,
+                    best_roc,
+                    int(best_emp) if best_emp is not None else None,
+                    survivor_cid,
+                ),
+            )
+
+    return {
+        "groups_merged": len(merges_summary),
+        "duplicates_removed": removed_total,
+        "merges": merges_summary,
     }
 
 

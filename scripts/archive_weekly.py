@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.contractor_profiles import backfill_contractor_profiles
-from src.db import init_db
+from src.db import deduplicate_contractors, init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.adot_archive import sync_adot_as_read_history, sync_adot_stb_awards
 from src.scrapers.bidnet_az import run_all_bidnet_syncs
@@ -118,6 +118,15 @@ def main() -> int:
         report["chandler"] = {"error": str(exc)}
 
     if not args.dry_run:
+        try:
+            report["contractors_deduped"] = deduplicate_contractors(args.db)
+            if isinstance(report["contractors_deduped"], dict):
+                report["contractors_deduped"] = {
+                    "groups_merged": report["contractors_deduped"].get("groups_merged", 0),
+                    "duplicates_removed": report["contractors_deduped"].get("duplicates_removed", 0),
+                }
+        except Exception as exc:
+            report["contractors_deduped"] = {"error": str(exc)}
         try:
             report["contractors_enriched"] = backfill_contractor_profiles(args.db)
         except Exception as exc:

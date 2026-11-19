@@ -137,12 +137,47 @@ _UNIT_MAP = {
 }
 
 
+_ENTITY_END_MARKERS = {
+    "INC",
+    "INCORPORATED",
+    "LLC",
+    "CORP",
+    "CORPORATION",
+    "LTD",
+    "LIMITED",
+    "LLP",
+    "PLLC",
+    "PC",
+    "PLC",
+}
+
+_TRAILING_GEO_SUFFIXES = {
+    "AZ",
+    "ARIZONA",
+    "PHOENIX",
+    "TUCSON",
+    "TEMPE",
+    "MESA",
+    "CHANDLER",
+    "GILBERT",
+    "GLENDALE",
+    "SCOTTSDALE",
+    "AVONDALE",
+    "PEORIA",
+    "PRESCOTT",
+    "FLAGSTAFF",
+    "YUMA",
+    "USA",
+}
+
+
 def normalize_contractor_name(raw_name: str) -> str:
     """Normalize contractor name to canonical uppercase without punctuation or legal suffixes.
 
     Example:
         "Fann Contracting, Inc." -> "FANN CONTRACTING"
         "Fisher Sand & Gravel Co., LLC" -> "FISHER SAND AND GRAVEL"
+        "Markham Contracting Co., Inc. (Phoenix, AZ)" -> "MARKHAM CONTRACTING"
     """
     if not raw_name:
         return ""
@@ -152,8 +187,20 @@ def normalize_contractor_name(raw_name: str) -> str:
     name = re.sub(r"[^\w\s]", " ", name)
     tokens = name.split()
 
-    # Strip trailing legal suffixes (e.g., "CO INC", "LLC")
-    while tokens and tokens[-1] in _LEGAL_SUFFIXES:
+    # Preserve Joint Ventures distinctly, but drop trailing address/state/junk after a
+    # strong entity marker (e.g. "MARKHAM CONTRACTING CO INC ARIZONA" -> "MARKHAM CONTRACTING")
+    is_jv = "JV" in tokens or ("JOINT" in tokens and "VENTURE" in tokens)
+    if not is_jv:
+        for idx, tok in enumerate(tokens):
+            if idx >= 1 and tok in _ENTITY_END_MARKERS:
+                tokens = tokens[:idx]
+                break
+
+    # Strip trailing legal suffixes and geographic division tags (e.g., "CO INC", "AZ", "PHOENIX")
+    while tokens and (
+        tokens[-1] in _LEGAL_SUFFIXES
+        or (len(tokens) >= 2 and tokens[-1] in _TRAILING_GEO_SUFFIXES and tokens[-2] not in ("OF", "NORTH", "SOUTH", "EAST", "WEST"))
+    ):
         tokens.pop()
 
     return " ".join(tokens)
