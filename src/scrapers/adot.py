@@ -628,9 +628,10 @@ def get_itemized_adot_project_nums(db_path: Path | str | None = None) -> set[str
             LEFT JOIN contractors c ON bl.contractor_id = c.contractor_id
             WHERE p.agency = 'ADOT'
               AND bl.is_engineers_estimate = 0
-              AND COALESCE(c.canonical_name, '') NOT LIKE 'ADOT LOW BIDDER%'
-              AND COALESCE(c.canonical_name, '') NOT LIKE 'ADOT BIDDER%'
-            """
+              AND COALESCE(c.canonical_name, '') NOT LIKE ?
+              AND COALESCE(c.canonical_name, '') NOT LIKE ?
+            """,
+            ("ADOT LOW BIDDER%", "ADOT BIDDER%"),
         ).fetchall()
     return {str(r[0]) for r in rows if r[0]}
 

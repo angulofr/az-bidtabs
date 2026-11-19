@@ -484,7 +484,8 @@ def sync_adot_stb_awards(
         seen_sources = {
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT source_url FROM projects WHERE agency = 'ADOT' AND source_url LIKE '%Awards%'"
+                "SELECT DISTINCT source_url FROM projects WHERE agency = 'ADOT' AND source_url LIKE ?",
+                ("%Awards%",),
             ).fetchall()
             if r[0]
         }
@@ -552,10 +553,10 @@ def sync_adot_stb_awards(
                                    awarded_contractor_id IS NULL
                                    OR awarded_contractor_id IN (
                                      SELECT contractor_id FROM contractors
-                                     WHERE canonical_name LIKE 'ADOT LOW BIDDER%'
+                                     WHERE canonical_name LIKE ?
                                    )
                                  )""",
-                            (cid, rec.meeting_date or None, rec.award_amount, pid),
+                            (cid, rec.meeting_date or None, rec.award_amount, pid, "ADOT LOW BIDDER%"),
                         )
                         ingested_projects += 1
             else:
@@ -764,7 +765,8 @@ def sync_adot_as_read_history(
         existing_detail_urls = {
             r[0]
             for r in conn.execute(
-                "SELECT source_url FROM projects WHERE agency = 'ADOT' AND source_url LIKE '%/as-read/details/%'"
+                "SELECT source_url FROM projects WHERE agency = 'ADOT' AND source_url LIKE ?",
+                ("%/as-read/details/%",),
             ).fetchall()
             if r[0]
         }
