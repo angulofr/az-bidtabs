@@ -594,6 +594,32 @@ def test_project_bids_summary_table_deduplication_and_details(tmp_path: Path):
     assert det["summary"]["total_won_volume"] == 1132972.60
 
 
+def test_app_hot_reload_recovers_stale_src_db_and_boots(tmp_path: Path, monkeypatch):
+    """Simulate Streamlit Cloud hot-pull where cached src.db predates upsert_project_bid."""
+    import importlib
+    import sys
+    from streamlit.testing.v1 import AppTest
+
+    import src.db as db_mod
+    from src.scrapers import maricopa_bidsync
+
+    monkeypatch.setenv("AZ_BIDTABS_DB", str(tmp_path / "hotreload.db"))
+    monkeypatch.setenv("PRODUCTION_MODE", "0")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    # Remove upsert_project_bid from loaded src.db module object to mirror pre-update sys.modules
+    monkeypatch.delattr(db_mod, "upsert_project_bid", raising=False)
+    assert "src.scrapers.maricopa_bidsync" in sys.modules
+    assert not hasattr(sys.modules["src.db"], "upsert_project_bid")
+
+    app_path = Path(__file__).resolve().parents[1] / "app.py"
+    at = AppTest.from_file(str(app_path), default_timeout=30).run()
+    assert len(at.exception) == 0, f"Unexpected AppTest exceptions: {at.exception}"
+    assert hasattr(sys.modules["src.db"], "upsert_project_bid")
+    assert hasattr(importlib.reload(maricopa_bidsync), "run_maricopa_bidsync_sync")
+
+
+
 
 
 

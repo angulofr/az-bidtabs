@@ -9,8 +9,45 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 ROOT_DIR = Path(__file__).resolve().parent
-if str(ROOT_DIR) not in sys.path:
+if not sys.path or sys.path[0] != str(ROOT_DIR):
     sys.path.insert(0, str(ROOT_DIR))
+
+
+def _reload_az_bidtabs_modules() -> None:
+    """Reload already-imported local modules in dependency order after Streamlit hot-pulls."""
+    root_resolved = ROOT_DIR.resolve()
+    for mod_name in (
+        "src",
+        "src.normalize",
+        "src.contractor_profiles",
+        "src.db",
+        "src.matching",
+        "src.seed",
+        "src.scrapers",
+        "src.scrapers.adot",
+        "src.scrapers.bonfire",
+        "src.scrapers.scottsdale_bonfire",
+        "src.scrapers.adot_archive",
+        "src.scrapers.maricopa_bidsync",
+        "src.scrapers.maricopa_onbase",
+        "src.scrapers.mesa_chandler",
+        "src.scrapers.phoenix_opengov",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        mod_file = getattr(mod, "__file__", "") or ""
+        try:
+            in_repo = bool(mod_file) and Path(mod_file).resolve().is_relative_to(root_resolved)
+        except Exception:
+            in_repo = False
+        if in_repo:
+            importlib.reload(mod)
+        else:
+            sys.modules.pop(mod_name, None)
+
+
+_reload_az_bidtabs_modules()
 
 import pandas as pd
 import plotly.express as px
@@ -44,12 +81,6 @@ from src.scrapers import maricopa_bidsync as mcdot_scraper
 from src.scrapers import mesa_chandler as mesa_chandler_scraper
 from src.scrapers import phoenix_opengov as opengov_scraper
 from src.seed import seed_database
-
-importlib.reload(adot_scraper)
-importlib.reload(bonfire_scraper)
-importlib.reload(mcdot_scraper)
-importlib.reload(mesa_chandler_scraper)
-importlib.reload(opengov_scraper)
 
 st.set_page_config(
     page_title="AZ BidTabs | Arizona Heavy-Civil Bid Intelligence",
