@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -496,26 +497,31 @@ def sync_adot_stb_awards(
     skipped = 0
     errors: list[str] = []
 
-    for item in pdfs[:limit]:
-        pdf_url = item["pdf_url"]
-        if pdf_url in seen_sources:
-            skipped += 1
-            continue
-        try:
-            resp = sess.get(pdf_url, timeout=30)
-            if not resp.ok:
-                skipped += 1
-                continue
-            records = parse_stb_awards_pdf(
-                resp.content,
-                meeting_date=item.get("meeting_date", ""),
-                source_url=pdf_url,
-            )
-            pdfs_processed += 1
-            if not records:
-                continue
-            if not dry_run:
-                with db_session(db_path) as conn:
+    if not dry_run:
+        with db_session(db_path) as conn:
+            for item in pdfs[:limit]:
+                pdf_url = item["pdf_url"]
+                if pdf_url in seen_sources:
+                    skipped += 1
+                    continue
+                try:
+                    resp = sess.get(pdf_url, timeout=25)
+                    if not resp.ok:
+                        skipped += 1
+                        continue
+                    records = parse_stb_awards_pdf(
+                        resp.content,
+                        meeting_date=item.get("meeting_date", ""),
+                        source_url=pdf_url,
+                    )
+                    pdfs_processed += 1
+                    if pdfs_processed % 25 == 0:
+                        print(
+                            f"[adot_stb] processed={pdfs_processed} projects={ingested_projects}",
+                            flush=True,
+                        )
+                    if not records:
+                        continue
                     for rec in records:
                         cid = upsert_contractor(conn, rec.low_bidder)
                         title = rec.description[:140] or f"ADOT Project {rec.tracs_num}"
@@ -542,7 +548,6 @@ def sync_adot_stb_awards(
                                 is_winner=True,
                             )
                             ingested_bids += 1
-                        # Upgrade anonymous E2C2 placeholder award if present
                         conn.execute(
                             """UPDATE projects
                                SET awarded_contractor_id = ?,
@@ -559,11 +564,30 @@ def sync_adot_stb_awards(
                             (cid, rec.meeting_date or None, rec.award_amount, pid, "ADOT LOW BIDDER%"),
                         )
                         ingested_projects += 1
-            else:
+                    conn.commit()
+                except Exception as exc:
+                    errors.append(f"{pdf_url}: {exc}")
+    else:
+        for item in pdfs[:limit]:
+            pdf_url = item["pdf_url"]
+            if pdf_url in seen_sources:
+                skipped += 1
+                continue
+            try:
+                resp = sess.get(pdf_url, timeout=25)
+                if not resp.ok:
+                    skipped += 1
+                    continue
+                records = parse_stb_awards_pdf(
+                    resp.content,
+                    meeting_date=item.get("meeting_date", ""),
+                    source_url=pdf_url,
+                )
+                pdfs_processed += 1
                 ingested_projects += len(records)
                 ingested_bids += len(records)
-        except Exception as exc:
-            errors.append(f"{pdf_url}: {exc}")
+            except Exception as exc:
+                errors.append(f"{pdf_url}: {exc}")
 
     return {
         "agency": "ADOT",
@@ -753,8 +777,10 @@ def sync_adot_as_read_history(
     start_year: int = 2001,
     end_year: int = 2026,
     max_seq_per_year: int = 250,
-    max_consecutive_misses: int = 8,
+    max_consecutive_misses: int = 4,
     limit: int = 2500,
+    timeout: int = 8,
+    max_workers: int = 6,
     dry_run: bool = False,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
@@ -776,7 +802,7 @@ def sync_adot_as_read_history(
 
     # Seed from current /as-read index page first (recent items)
     try:
-        idx_resp = sess.get(ADOT_AS_READ_INDEX_URL, timeout=20)
+        idx_resp = sess.get(ADOT_AS_READ_INDEX_URL, timeout=15)
         if idx_resp.ok:
             idx_soup = BeautifulSoup(idx_resp.text, "html.parser")
             for a in idx_soup.select("a[href*='/as-read/details/']"):
@@ -793,59 +819,106 @@ def sync_adot_as_read_history(
     checked = 0
     errors: list[str] = []
 
-    def _process_id(did: str) -> bool:
-        """Fetch & ingest one detail_id. Returns True if valid page existed, False if missing/error."""
-        nonlocal ingested_projects, ingested_bids, skipped, checked
+    def _fetch_one(did: str) -> tuple[str, ParsedAsReadProject | None, str | None]:
         url = ADOT_AS_READ_DETAIL_URL.format(detail_id=did)
-        if url in existing_detail_urls:
-            skipped += 1
-            return True
-        checked += 1
         try:
-            resp = sess.get(url, timeout=20)
+            local_sess = sess if session is not None else _is_valid_session(None)
+            resp = local_sess.get(url, timeout=timeout)
             if not resp.ok:
-                return False
+                return (did, None, None)
             parsed = parse_as_read_detail_html(resp.text, detail_id=did, source_url=url)
+            return (did, parsed, None)
+        except Exception as exc:
+            return (did, None, f"{did}: {exc}")
+
+    def _consume_batch(dids: list[str], conn: Any | None) -> list[bool]:
+        nonlocal ingested_projects, ingested_bids, skipped, checked
+        to_fetch: list[str] = []
+        pre_status: dict[str, bool] = {}
+        for did in dids:
+            url = ADOT_AS_READ_DETAIL_URL.format(detail_id=did)
+            if url in existing_detail_urls:
+                skipped += 1
+                pre_status[did] = True
+            else:
+                checked += 1
+                to_fetch.append(did)
+
+        fetched: dict[str, ParsedAsReadProject | None] = {}
+        if to_fetch:
+            if session is None and max_workers > 1 and len(to_fetch) > 1:
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(to_fetch))) as pool:
+                    results = list(pool.map(_fetch_one, to_fetch))
+            else:
+                results = [_fetch_one(did) for did in to_fetch]
+            for did, parsed, err in results:
+                if err:
+                    # Short timeout on missing detail IDs is expected; don't spam errors
+                    if "timed out" not in err.lower():
+                        errors.append(err)
+                fetched[did] = parsed
+
+        statuses: list[bool] = []
+        for did in dids:
+            if did in pre_status:
+                statuses.append(True)
+                continue
+            parsed = fetched.get(did)
             if parsed is None:
-                return False
-            if not dry_run:
-                with db_session(db_path) as conn:
-                    cnt = _ingest_as_read_project(parsed, conn)
+                statuses.append(False)
+                continue
+            if not dry_run and conn is not None:
+                cnt = _ingest_as_read_project(parsed, conn)
                 ingested_bids += cnt
             else:
                 ingested_bids += len(parsed.bidders)
-            existing_detail_urls.add(url)
+            existing_detail_urls.add(parsed.source_url)
             ingested_projects += 1
-            return True
-        except Exception as exc:
-            errors.append(f"{did}: {exc}")
-            return False
+            statuses.append(True)
+        if not dry_run and conn is not None and to_fetch:
+            conn.commit()
+        return statuses
 
-    for did in candidate_ids:
-        if checked >= limit:
-            break
-        _process_id(did)
+    with db_session(db_path) as conn:
+        active_conn = None if dry_run else conn
+        if candidate_ids:
+            batch = candidate_ids[:limit]
+            _consume_batch(batch, active_conn)
 
-    # Sequential sweep by year from newest to oldest
-    for year in range(end_year, start_year - 1, -1):
-        if checked >= limit:
-            break
-        consecutive_misses = 0
-        for seq in range(1, max_seq_per_year + 1):
+        chunk_size = max(max_workers, 4) if session is None else 1
+        for year in range(end_year, start_year - 1, -1):
             if checked >= limit:
                 break
-            did = f"{year}{seq:03d}"
-            if did in seen_ids:
-                consecutive_misses = 0
-                continue
-            seen_ids.add(did)
-            found = _process_id(did)
-            if found:
-                consecutive_misses = 0
-            else:
-                consecutive_misses += 1
-                if consecutive_misses >= max_consecutive_misses:
+            consecutive_misses = 0
+            seq = 1
+            while seq <= max_seq_per_year and checked < limit:
+                dids: list[str] = []
+                while len(dids) < chunk_size and seq <= max_seq_per_year and checked + len(dids) < limit:
+                    did = f"{year}{seq:03d}"
+                    seq += 1
+                    if did in seen_ids:
+                        consecutive_misses = 0
+                        continue
+                    seen_ids.add(did)
+                    dids.append(did)
+                if not dids:
+                    continue
+                statuses = _consume_batch(dids, active_conn)
+                stop_year = False
+                for found in statuses:
+                    if found:
+                        consecutive_misses = 0
+                    else:
+                        consecutive_misses += 1
+                        if consecutive_misses >= max_consecutive_misses:
+                            stop_year = True
+                            break
+                if stop_year:
                     break
+            print(
+                f"[adot_as_read] year={year} checked={checked} ingested={ingested_projects} skipped={skipped}",
+                flush=True,
+            )
 
     return {
         "agency": "ADOT",
