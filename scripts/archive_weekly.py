@@ -17,8 +17,10 @@ if str(ROOT) not in sys.path:
 from src.contractor_profiles import backfill_contractor_profiles
 from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
+from src.scrapers.adot_archive import sync_adot_as_read_history, sync_adot_stb_awards
 from src.scrapers.bonfire import run_all_bonfire_syncs
 from src.scrapers.maricopa_bidsync import run_maricopa_bidsync_sync
+from src.scrapers.maricopa_onbase import run_maricopa_onbase_sync
 from src.scrapers.mesa_chandler import run_chandler_sync, run_mesa_sync
 from src.scrapers.phoenix_opengov import run_phoenix_opengov_sync
 
@@ -33,9 +35,12 @@ def main() -> int:
     init_db(args.db)
     report: dict[str, object] = {
         "adot": None,
+        "adot_stb_awards": None,
+        "adot_as_read_recent": None,
         "phoenix_opengov": None,
         "bonfire": None,
         "mcdot_bidsync": None,
+        "maricopa_onbase": None,
         "mesa": None,
         "chandler": None,
     }
@@ -44,6 +49,24 @@ def main() -> int:
         report["adot"] = run_adot_archive_sync(args.db, limit=args.limit, dry_run=args.dry_run)
     except Exception as exc:
         report["adot"] = {"error": str(exc)}
+
+    try:
+        report["adot_stb_awards"] = sync_adot_stb_awards(
+            args.db, max_pages=2, limit=max(args.limit, 10), dry_run=args.dry_run
+        )
+    except Exception as exc:
+        report["adot_stb_awards"] = {"error": str(exc)}
+
+    try:
+        report["adot_as_read_recent"] = sync_adot_as_read_history(
+            args.db,
+            start_year=2024,
+            end_year=2026,
+            limit=max(args.limit, 50),
+            dry_run=args.dry_run,
+        )
+    except Exception as exc:
+        report["adot_as_read_recent"] = {"error": str(exc)}
 
     try:
         report["phoenix_opengov"] = run_phoenix_opengov_sync(
@@ -62,6 +85,13 @@ def main() -> int:
         )
     except Exception as exc:
         report["mcdot_bidsync"] = {"error": str(exc)}
+
+    try:
+        report["maricopa_onbase"] = run_maricopa_onbase_sync(
+            args.db, limit=max(args.limit, 50), dry_run=args.dry_run
+        )
+    except Exception as exc:
+        report["maricopa_onbase"] = {"error": str(exc)}
 
     try:
         report["mesa"] = run_mesa_sync(args.db, limit=args.limit, dry_run=args.dry_run)

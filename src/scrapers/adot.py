@@ -25,6 +25,8 @@ from src.normalize import normalize_item_code, normalize_unit
 
 ADOT_E2C2_URL = "https://apps.azdot.gov/e2c2/HistoricalPrice.aspx"
 ADOT_BID_TABS_URL = "https://azdot.gov/business/contracts-and-specifications/bid-tabulations"
+ADOT_CNSADS_TABULATIONS_URL = "https://cnsads.azdot.gov/tabulations"
+TRACS_RE = re.compile(r"(?<![A-Z0-9])([FHT]\d{3,5}[0-9A-Z]{2,4})(?![A-Z0-9])", re.IGNORECASE)
 
 _MONEY_RE = re.compile(r"^\$?\s*([\d,]+\.\d{2,4})$")
 _ITEM_LINE_RE = re.compile(
@@ -259,12 +261,8 @@ def parse_adot_bid_tab_pdf(
 
     full_text = "\n".join(all_text_lines)
 
-    # Extract TRACS number (e.g. F069101C, H687001C) or Proposal Pamphlet ID (e.g. 2026005)
-    tracs_match = re.search(
-        r"(?<![A-Z0-9])([FH]\d{3,5}[0-9A-Z]{2,4})(?![A-Z0-9])",
-        f"{src_name}\n{full_text}",
-        re.IGNORECASE,
-    )
+    # Extract TRACS number (e.g. F069101C, H687001C, T023501C) or Proposal Pamphlet ID (e.g. 2026005)
+    tracs_match = TRACS_RE.search(f"{src_name}\n{full_text}")
     pamphlet_match = re.search(
         r"(?:BID\s+RESULTS\s+FOR|PROPOSAL\s+PAMPHLET)\s+([A-Z0-9\-]+)",
         full_text,
@@ -554,8 +552,44 @@ def ingest_parsed_project(
         return project_id
 
 
+def _extract_pdf_links_from_html(
+    html: str,
+    base_url: str,
+    *,
+    limit: int = 50,
+) -> list[dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    discovered: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for a in soup.select("a[href]"):
+        href = str(a.get("href", "")).strip()
+        if ".pdf" not in href.lower():
+            continue
+        full_url = urljoin(base_url, href)
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+
+        link_text = a.get_text(" ", strip=True) or Path(href.split("?")[0]).stem
+        tr_parent = a.find_parent("tr")
+        row_text = tr_parent.get_text(" ", strip=True) if tr_parent else link_text
+        tracs_match = TRACS_RE.search(f"{row_text} {link_text} {href}")
+        proj_num = tracs_match.group(1).upper() if tracs_match else Path(href.split("?")[0]).stem[:24]
+        title = row_text if (tr_parent and len(link_text) < 16) else link_text
+        discovered.append(
+            {
+                "url": full_url,
+                "title": title[:220],
+                "project_num": proj_num,
+            }
+        )
+        if len(discovered) >= limit:
+            break
+    return discovered
+
+
 def discover_adot_bid_tab_pdfs(
-    url: str = ADOT_BID_TABS_URL,
+    url: str | None = None,
     *,
     limit: int = 50,
     timeout: int = 20,
@@ -566,34 +600,39 @@ def discover_adot_bid_tab_pdfs(
     sess.headers.update(
         {"User-Agent": "AZ-BidTabs/1.0 (+https://azbidtabs.example; heavy-civil-intel)"}
     )
-    resp = sess.get(url, timeout=timeout)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    discovered: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
-    for a in soup.select("a[href]"):
-        href = str(a.get("href", "")).strip()
-        if ".pdf" not in href.lower():
+    candidates = [url] if url else [ADOT_CNSADS_TABULATIONS_URL, ADOT_BID_TABS_URL]
+    last_exc: Exception | None = None
+    for target in candidates:
+        try:
+            resp = sess.get(target, timeout=timeout)
+            resp.raise_for_status()
+            links = _extract_pdf_links_from_html(resp.text, target, limit=limit)
+            if links or len(candidates) == 1:
+                return links
+        except Exception as exc:
+            last_exc = exc
             continue
-        full_url = urljoin(url, href)
-        if full_url in seen_urls:
-            continue
-        seen_urls.add(full_url)
+    if last_exc is not None:
+        raise last_exc
+    return []
 
-        link_text = a.get_text(" ", strip=True) or Path(href.split("?")[0]).stem
-        tracs_match = re.search(r"\b([FH]\d{3,5}[0-9A-Z]{2,4})\b", f"{link_text} {href}", re.IGNORECASE)
-        proj_num = tracs_match.group(1).upper() if tracs_match else Path(href.split("?")[0]).stem[:24]
-        discovered.append(
-            {
-                "url": full_url,
-                "title": link_text,
-                "project_num": proj_num,
-            }
-        )
-        if len(discovered) >= limit:
-            break
-    return discovered
+
+def get_itemized_adot_project_nums(db_path: Path | str | None = None) -> set[str]:
+    """Return ADOT project numbers that already have named-contractor itemized bid_lines."""
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT p.agency_project_num
+            FROM projects p
+            JOIN bid_lines bl ON p.project_id = bl.project_id
+            LEFT JOIN contractors c ON bl.contractor_id = c.contractor_id
+            WHERE p.agency = 'ADOT'
+              AND bl.is_engineers_estimate = 0
+              AND COALESCE(c.canonical_name, '') NOT LIKE 'ADOT LOW BIDDER%'
+              AND COALESCE(c.canonical_name, '') NOT LIKE 'ADOT BIDDER%'
+            """
+        ).fetchall()
+    return {str(r[0]) for r in rows if r[0]}
 
 
 def run_adot_archive_sync(
@@ -607,14 +646,7 @@ def run_adot_archive_sync(
     """Discover, download, parse, and archive ADOT bid tab PDFs not yet in the database."""
     sess = session or requests.Session()
     links = discover_adot_bid_tab_pdfs(limit=limit, timeout=timeout, session=sess)
-
-    with db_session(db_path) as conn:
-        existing_nums = {
-            r[0]
-            for r in conn.execute(
-                "SELECT agency_project_num FROM projects WHERE agency = 'ADOT'"
-            ).fetchall()
-        }
+    existing_nums = get_itemized_adot_project_nums(db_path)
 
     ingested = 0
     skipped = 0
@@ -631,13 +663,17 @@ def run_adot_archive_sync(
             pdf_resp = sess.get(item["url"], timeout=timeout)
             pdf_resp.raise_for_status()
             parsed = parse_adot_bid_tab_pdf(pdf_resp.content)
-            if parsed.agency_project_num == "ADOT-UNKNOWN":
+            if parsed.agency_project_num == "ADOT-UNKNOWN" or (
+                TRACS_RE.fullmatch(item["project_num"])
+                and not TRACS_RE.fullmatch(parsed.agency_project_num)
+            ):
                 parsed.agency_project_num = item["project_num"]
             if not parsed.title or parsed.title.startswith("ADOT Project "):
                 parsed.title = item["title"]
             parsed.source_url = item["url"]
             if parsed.lines:
                 ingest_parsed_project(parsed, db_path)
+                existing_nums.add(parsed.agency_project_num)
                 ingested += 1
             else:
                 skipped += 1

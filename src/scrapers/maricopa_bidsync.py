@@ -12,7 +12,12 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-from src.db import db_session
+from src.db import (
+    db_session,
+    upsert_contractor,
+    upsert_project,
+    upsert_project_bid,
+)
 from src.scrapers.adot import ParsedBidLine, ParsedProjectBidTab, ingest_parsed_project
 from src.scrapers.bonfire import is_civil_project
 
@@ -27,6 +32,48 @@ _BIDSYNC_TABLE_ID = "elasticBidSearchForm:bidSearchParametersComponent:linksBidS
 DEFAULT_CIVIL_QUERY = (
     "DBB OR asphalt OR roadway OR pavement OR concrete OR waterline OR sewer OR drainage OR bridge OR traffic"
 )
+
+_MARICOPA_CIVIL_ABBREV_RE = re.compile(
+    r"\b(RD|HWY|AVE|BLVD|PKWY|FCD|MCDOT|GUARDRAIL|CHANNEL|CULVERT|SIGNING|"
+    r"SIGNAL|STRIPING|OVERLAY|MILLING|DETENTION|RETENTION|LEVEE|CANAL|"
+    r"ROUNDABOUT|DRAINAGE|EXCAVATION|GRADING|PAVING|RESURFACING|INTERSECTION|"
+    r"FLOOD|STORMWATER|SEWER|WATERLINE|SIDEWALK|CURB|BRIDGE|ROADWAY|STREET)\b"
+    r"|CHIP\s+SEAL|\bTT\d{3,5}\b|\bJOC\b",
+    re.IGNORECASE,
+)
+_MARICOPA_NON_CIVIL_EXCLUSIONS = (
+    "TRAILER",
+    "BOAT",
+    "KAYAK",
+    "MATTRESS",
+    "SHOE",
+    "FLOUR",
+    "ANIMAL",
+    "JANITORIAL",
+    "AMMUNITION",
+    "GLOVE",
+    "UNIFORM",
+    "SOFTWARE",
+    "COPIER",
+    "PRINTING SERVICE",
+    "PHARMACEUTICAL",
+    "VETERINARY",
+    "FURNITURE",
+)
+
+
+def is_maricopa_civil_project(title: str) -> bool:
+    """Return True if a Maricopa BidSync title looks like heavy-civil/MCDOT/FCD construction."""
+    upper = (title or "").upper()
+    if not upper:
+        return False
+    strong_civil = any(
+        tok in upper
+        for tok in ("ROADWAY", "PAVING", "ASPHALT", "BRIDGE", "CULVERT", "STORM DRAIN", "MCDOT", "FCD", "SEWER", "WATERLINE")
+    )
+    if any(excl in upper for excl in _MARICOPA_NON_CIVIL_EXCLUSIONS) and not strong_civil:
+        return False
+    return is_civil_project(title) or bool(_MARICOPA_CIVIL_ABBREV_RE.search(title))
 
 _MONEY_RE = re.compile(r"^\$?\s*([\d,]+\.\d{2,4})$")
 _QTY_RE = re.compile(r"^[\d,]+(?:\.\d+)?$")
@@ -103,7 +150,7 @@ def _extract_listings_from_soup(
         tab_url = _normalize_bidsync_tab_url(str(tab_anchor.get("href") or ""))
         if not proj_num or not tab_url or tab_url in seen_tabs:
             continue
-        if civil_only and not is_civil_project(title):
+        if civil_only and not is_maricopa_civil_project(title):
             continue
         seen_tabs.add(tab_url)
         batch.append(
@@ -143,6 +190,7 @@ def fetch_bidsync_listings(
     *,
     query: str = DEFAULT_CIVIL_QUERY,
     civil_only: bool = True,
+    max_ajax_pages: int = 100,
     timeout: int = 25,
     session: requests.Session | None = None,
 ) -> list[BidSyncListing]:
@@ -178,11 +226,12 @@ def fetch_bidsync_listings(
     seen_tabs: set[str] = set()
     listings = _extract_listings_from_soup(soup, seen_tabs, civil_only=civil_only)
 
-    # Paginate via PrimeFaces AJAX in chunks of 50 when more historical bids are requested
+    # Paginate via PrimeFaces AJAX in chunks of 50 when more historical bids are requested.
+    # BidSync occasionally renders 45-47 rows on full 50-row pages, so always step by 50
+    # and stop only when 0 rows return.
     vs_input = soup.find("input", {"name": "javax.faces.ViewState"})
     vs_val = str(vs_input.get("value") or "") if vs_input else ""
     first_offset = 10
-    max_ajax_pages = 10
 
     for _ in range(max_ajax_pages):
         if len(listings) >= limit or not vs_val:
@@ -219,8 +268,8 @@ def fetch_bidsync_listings(
             listings.extend(
                 _extract_listings_from_soup(ajax_soup, seen_tabs, civil_only=civil_only)
             )
-            first_offset += raw_data_rows
-            if raw_data_rows < 50:
+            first_offset += 50
+            if raw_data_rows < 25:
                 break
         except requests.RequestException:
             break
@@ -237,15 +286,20 @@ def _split_item_code_and_desc(raw_label: str, fallback_idx: int) -> tuple[str, s
     return (f"ITEM-{fallback_idx}", text)
 
 
-def parse_bidsync_tab_html(
+def parse_bidsync_tab_with_totals(
     html: str,
     *,
     project_num: str = "",
     title: str = "",
     letting_date: str = "",
     source_url: str = "",
-) -> ParsedProjectBidTab:
-    """Parse an unauthenticated BidSync `awgroupreview&expandall=Y` HTML page."""
+) -> tuple[ParsedProjectBidTab, list[tuple[str, float, bool]]]:
+    """Parse an unauthenticated BidSync `awgroupreview&expandall=Y` HTML page.
+
+    Returns `(parsed_project, bidder_totals)` where `bidder_totals` contains
+    `(supplier_name, bid_total, is_winner)` even for lump-sum / total-only bids
+    that have no itemized unit-price lines.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     if not project_num or not title:
@@ -266,15 +320,27 @@ def parse_bidsync_tab_html(
     )
 
     supplier_blocks: list[tuple[str, bool, float, list[ParsedBidLine]]] = []
+    raw_totals: list[tuple[str, bool, float]] = []
 
     target_table = None
-    for tbl in soup.find_all("table"):
-        if len(tbl.find_all("table")) == 0 and "Unit Price" in tbl.get_text(" ", strip=True):
+    leaf_tables = [tbl for tbl in soup.find_all("table") if len(tbl.find_all("table")) == 0]
+    for tbl in leaf_tables:
+        if "Unit Price" in tbl.get_text(" ", strip=True):
             target_table = tbl
             break
+    if target_table is None:
+        for tbl in leaf_tables:
+            txt_upper = tbl.get_text(" ", strip=True).upper()
+            has_supplier_img = any(
+                "click to open supplier bid information" in str(img.get("alt") or "").lower()
+                for img in tbl.find_all("img")
+            )
+            if has_supplier_img or "TOTAL PRICE:" in txt_upper:
+                target_table = tbl
+                break
 
     if target_table is None:
-        return parsed
+        return parsed, []
 
     current_supplier = ""
     current_awarded = False
@@ -284,9 +350,14 @@ def parse_bidsync_tab_html(
 
     def _flush_supplier() -> None:
         nonlocal current_supplier, current_awarded, current_lines, current_total, in_items
-        if current_supplier and current_lines:
-            total = current_total or round(sum(l.extended_total for l in current_lines), 2)
-            supplier_blocks.append((current_supplier, current_awarded, total, current_lines))
+        if current_supplier:
+            total = current_total or (
+                round(sum(l.extended_total for l in current_lines), 2) if current_lines else 0.0
+            )
+            if current_lines:
+                supplier_blocks.append((current_supplier, current_awarded, total, current_lines))
+            if total > 0:
+                raw_totals.append((current_supplier, current_awarded, total))
         current_supplier = ""
         current_awarded = False
         current_lines = []
@@ -347,22 +418,84 @@ def parse_bidsync_tab_html(
 
     _flush_supplier()
 
-    if not supplier_blocks:
-        return parsed
-
-    # Rank bidders by total ascending (keeping awarded supplier first if marked)
-    supplier_blocks.sort(key=lambda b: (not b[1], b[2]))
-    for rank, (supplier, is_awarded, total, lines) in enumerate(supplier_blocks, start=1):
-        is_winner = is_awarded or (rank == 1 and not any(b[1] for b in supplier_blocks))
-        if is_winner:
+    # Build ranked bidder_totals even for lump-sum / total-only contracts
+    raw_totals.sort(key=lambda b: (not b[1], b[2]))
+    any_marked_awarded = any(b[1] for b in raw_totals)
+    bidder_totals: list[tuple[str, float, bool]] = []
+    for rank, (supplier, is_awarded, total) in enumerate(raw_totals, start=1):
+        is_winner = is_awarded or (rank == 1 and not any_marked_awarded)
+        bidder_totals.append((supplier, total, is_winner))
+        if is_winner and not parsed.awarded_contractor:
             parsed.awarded_contractor = supplier
             parsed.winning_bid_total = total
-        for line in lines:
-            line.bid_rank = rank
-            line.is_winner = is_winner
-            parsed.lines.append(line)
 
+    if supplier_blocks:
+        supplier_blocks.sort(key=lambda b: (not b[1], b[2]))
+        any_block_awarded = any(b[1] for b in supplier_blocks)
+        for rank, (supplier, is_awarded, total, lines) in enumerate(supplier_blocks, start=1):
+            is_winner = is_awarded or (rank == 1 and not any_block_awarded)
+            if is_winner:
+                parsed.awarded_contractor = supplier
+                parsed.winning_bid_total = total
+            for line in lines:
+                line.bid_rank = rank
+                line.is_winner = is_winner
+                parsed.lines.append(line)
+
+    return parsed, bidder_totals
+
+
+def parse_bidsync_tab_html(
+    html: str,
+    *,
+    project_num: str = "",
+    title: str = "",
+    letting_date: str = "",
+    source_url: str = "",
+) -> ParsedProjectBidTab:
+    """Parse an unauthenticated BidSync `awgroupreview&expandall=Y` HTML page."""
+    parsed, _ = parse_bidsync_tab_with_totals(
+        html,
+        project_num=project_num,
+        title=title,
+        letting_date=letting_date,
+        source_url=source_url,
+    )
     return parsed
+
+
+def _ingest_bidsync_totals_only(
+    parsed: ParsedProjectBidTab,
+    bidder_totals: list[tuple[str, float, bool]],
+    db_path: str | Any,
+) -> int:
+    with db_session(db_path) as conn:
+        winner_cid = None
+        if parsed.awarded_contractor:
+            winner_cid = upsert_contractor(conn, parsed.awarded_contractor)
+        pid = upsert_project(
+            conn,
+            agency=parsed.agency,
+            agency_project_num=parsed.agency_project_num,
+            title=parsed.title,
+            county=parsed.county,
+            letting_date=parsed.letting_date or None,
+            winning_bid_total=parsed.winning_bid_total,
+            awarded_contractor_id=winner_cid,
+            source_url=parsed.source_url,
+        )
+        for rank, (supplier, total, is_winner) in enumerate(bidder_totals, start=1):
+            cid = upsert_contractor(conn, supplier)
+            upsert_project_bid(
+                conn,
+                project_id=pid,
+                contractor_id=cid,
+                is_engineers_estimate=False,
+                bid_total=total,
+                bid_rank=rank,
+                is_winner=is_winner,
+            )
+    return len(bidder_totals)
 
 
 def run_maricopa_bidsync_sync(
@@ -370,24 +503,37 @@ def run_maricopa_bidsync_sync(
     *,
     limit: int = 15,
     query: str = DEFAULT_CIVIL_QUERY,
+    max_ajax_pages: int = 100,
     dry_run: bool = False,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Discover Maricopa County / MCDOT civil bids in BidSync and ingest line items."""
+    """Discover Maricopa County / MCDOT civil bids in BidSync and ingest line items or lump-sum totals."""
     sess = session or requests.Session()
-    listings = fetch_bidsync_listings(limit=limit, query=query, session=sess)
+    listings = fetch_bidsync_listings(
+        limit=limit,
+        query=query,
+        max_ajax_pages=max_ajax_pages,
+        session=sess,
+    )
 
     with db_session(db_path) as conn:
         existing_nums = {
             r[0]
             for r in conn.execute(
-                "SELECT agency_project_num FROM projects WHERE agency = 'MCDOT'"
+                """SELECT agency_project_num FROM projects
+                   WHERE agency = 'MCDOT'
+                     AND (
+                       EXISTS (SELECT 1 FROM bid_lines bl WHERE bl.project_id = projects.project_id)
+                       OR EXISTS (SELECT 1 FROM project_bids pb WHERE pb.project_id = projects.project_id)
+                     )"""
             ).fetchall()
         }
 
     ingested = 0
+    ingested_summary = 0
     skipped = 0
     total_lines = 0
+    total_project_bids = 0
     errors: list[str] = []
 
     for item in listings:
@@ -399,21 +545,30 @@ def run_maricopa_bidsync_sync(
             if not resp.ok or "DPXLogin" in resp.url:
                 skipped += 1
                 continue
-            parsed = parse_bidsync_tab_html(
+            parsed, bidder_totals = parse_bidsync_tab_with_totals(
                 resp.text,
                 project_num=item.project_num,
                 title=item.title,
                 letting_date=item.end_date,
                 source_url=item.tab_url,
             )
-            if not parsed.lines:
+            if parsed.lines:
+                if not dry_run:
+                    ingest_parsed_project(parsed, db_path)
+                existing_nums.add(parsed.agency_project_num)
+                ingested += 1
+                total_lines += len(parsed.lines)
+            elif bidder_totals:
+                if not dry_run:
+                    cnt = _ingest_bidsync_totals_only(parsed, bidder_totals, db_path)
+                else:
+                    cnt = len(bidder_totals)
+                existing_nums.add(parsed.agency_project_num)
+                ingested += 1
+                ingested_summary += 1
+                total_project_bids += cnt
+            else:
                 skipped += 1
-                continue
-            if not dry_run:
-                ingest_parsed_project(parsed, db_path)
-            existing_nums.add(parsed.agency_project_num)
-            ingested += 1
-            total_lines += len(parsed.lines)
         except Exception as exc:
             errors.append(f"{item.project_num}: {exc}")
 
@@ -421,7 +576,9 @@ def run_maricopa_bidsync_sync(
         "agency": "MCDOT",
         "discovered": len(listings),
         "ingested": ingested,
+        "ingested_summary_only": ingested_summary,
         "skipped": skipped,
         "total_bid_lines": total_lines,
+        "total_project_bids": total_project_bids,
         "errors": errors,
     }

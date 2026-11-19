@@ -122,6 +122,16 @@ CREATE TABLE IF NOT EXISTS bid_lines (
     is_winner INTEGER NOT NULL DEFAULT 0 CHECK (is_winner IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS project_bids (
+    project_bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    contractor_id INTEGER REFERENCES contractors(contractor_id),
+    is_engineers_estimate INTEGER NOT NULL DEFAULT 0 CHECK (is_engineers_estimate IN (0, 1)),
+    bid_total REAL NOT NULL,
+    bid_rank INTEGER,
+    is_winner INTEGER NOT NULL DEFAULT 0 CHECK (is_winner IN (0, 1))
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_agency ON projects(agency);
 CREATE INDEX IF NOT EXISTS idx_projects_county ON projects(county);
 CREATE INDEX IF NOT EXISTS idx_projects_letting ON projects(letting_date);
@@ -130,6 +140,8 @@ CREATE INDEX IF NOT EXISTS idx_pay_items_spec ON pay_items(spec_system);
 CREATE INDEX IF NOT EXISTS idx_bid_lines_project ON bid_lines(project_id);
 CREATE INDEX IF NOT EXISTS idx_bid_lines_item ON bid_lines(item_id);
 CREATE INDEX IF NOT EXISTS idx_bid_lines_contractor ON bid_lines(contractor_id);
+CREATE INDEX IF NOT EXISTS idx_project_bids_project ON project_bids(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_bids_contractor ON project_bids(contractor_id);
 """
 
 POSTGRES_STATEMENTS = [
@@ -193,6 +205,19 @@ POSTGRES_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_bid_lines_project ON bid_lines(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_bid_lines_item ON bid_lines(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_bid_lines_contractor ON bid_lines(contractor_id)",
+    """
+    CREATE TABLE IF NOT EXISTS project_bids (
+        project_bid_id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        contractor_id INTEGER REFERENCES contractors(contractor_id),
+        is_engineers_estimate INTEGER NOT NULL DEFAULT 0 CHECK (is_engineers_estimate IN (0, 1)),
+        bid_total DOUBLE PRECISION NOT NULL,
+        bid_rank INTEGER,
+        is_winner INTEGER NOT NULL DEFAULT 0 CHECK (is_winner IN (0, 1))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_bids_project ON project_bids(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_bids_contractor ON project_bids(contractor_id)",
     "ALTER TABLE contractors ADD COLUMN IF NOT EXISTS approx_employees INTEGER",
 ]
 
@@ -473,6 +498,57 @@ def insert_bid_line(
             1 if is_winner else 0,
         ),
         "bid_line_id",
+    )
+
+
+def upsert_project_bid(
+    conn: _DBConn,
+    *,
+    project_id: int,
+    contractor_id: int | None,
+    is_engineers_estimate: bool,
+    bid_total: float,
+    bid_rank: int | None = None,
+    is_winner: bool = False,
+) -> int:
+    """Insert or update a project-level bid summary (for lump-sum / as-read / STB awards)."""
+    est_flag = 1 if is_engineers_estimate else 0
+    cid = None if is_engineers_estimate else contractor_id
+    win_flag = 1 if (is_winner and not is_engineers_estimate) else 0
+
+    if cid is None:
+        existing = conn.execute(
+            "SELECT project_bid_id FROM project_bids WHERE project_id = ? AND contractor_id IS NULL AND is_engineers_estimate = ?",
+            (project_id, est_flag),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT project_bid_id FROM project_bids WHERE project_id = ? AND contractor_id = ? AND is_engineers_estimate = ?",
+            (project_id, cid, est_flag),
+        ).fetchone()
+
+    if existing:
+        pbid = int(existing[0])
+        conn.execute(
+            """
+            UPDATE project_bids
+            SET bid_total = ?,
+                bid_rank = COALESCE(?, bid_rank),
+                is_winner = CASE WHEN ? = 1 THEN 1 ELSE is_winner END
+            WHERE project_bid_id = ?
+            """,
+            (float(bid_total), bid_rank, win_flag, pbid),
+        )
+        return pbid
+
+    return conn.insert_returning_id(
+        """
+        INSERT INTO project_bids (
+            project_id, contractor_id, is_engineers_estimate, bid_total, bid_rank, is_winner
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (project_id, cid, est_flag, float(bid_total), bid_rank, win_flag),
+        "project_bid_id",
     )
 
 
@@ -761,23 +837,51 @@ def get_item_code_details(
 def get_contractor_scorecard(db_path: Path | str | None = None) -> pd.DataFrame:
     """Compute contractor win-rate, avg % vs Engineer's Estimate, and bid volume."""
     sql = """
-        WITH project_bids AS (
+        WITH itemized_bids AS (
             SELECT
                 bl.project_id,
                 bl.contractor_id,
+                SUM(bl.extended_total) AS bidder_total,
+                MAX(bl.is_winner) AS is_winner,
+                MIN(bl.bid_rank) AS bid_rank
+            FROM bid_lines bl
+            WHERE bl.is_engineers_estimate = 0 AND bl.contractor_id IS NOT NULL
+            GROUP BY bl.project_id, bl.contractor_id
+        ),
+        summary_bids AS (
+            SELECT
+                pb.project_id,
+                pb.contractor_id,
+                pb.bid_total AS bidder_total,
+                pb.is_winner,
+                pb.bid_rank
+            FROM project_bids pb
+            WHERE pb.is_engineers_estimate = 0
+              AND pb.contractor_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM itemized_bids ib
+                  WHERE ib.project_id = pb.project_id AND ib.contractor_id = pb.contractor_id
+              )
+        ),
+        combined_project_bids AS (
+            SELECT
+                cb.project_id,
+                cb.contractor_id,
                 c.canonical_name AS contractor_name,
                 c.approx_employees,
                 c.az_roc_license,
                 p.agency,
                 p.engineers_estimate,
-                SUM(bl.extended_total) AS bidder_total,
-                MAX(bl.is_winner) AS is_winner,
-                MIN(bl.bid_rank) AS bid_rank
-            FROM bid_lines bl
-            JOIN contractors c ON bl.contractor_id = c.contractor_id
-            JOIN projects p ON bl.project_id = p.project_id
-            WHERE bl.is_engineers_estimate = 0
-            GROUP BY bl.project_id, bl.contractor_id, c.canonical_name, c.approx_employees, c.az_roc_license, p.agency, p.engineers_estimate
+                cb.bidder_total,
+                cb.is_winner,
+                cb.bid_rank
+            FROM (
+                SELECT * FROM itemized_bids
+                UNION ALL
+                SELECT * FROM summary_bids
+            ) cb
+            JOIN contractors c ON cb.contractor_id = c.contractor_id
+            JOIN projects p ON cb.project_id = p.project_id
         )
         SELECT
             contractor_id,
@@ -792,7 +896,7 @@ def get_contractor_scorecard(db_path: Path | str | None = None) -> pd.DataFrame:
                 ELSE NULL END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS avg_pct_vs_ee,
             CAST(ROUND(CAST(SUM(bidder_total) AS NUMERIC), 2) AS DOUBLE PRECISION) AS total_bid_volume,
             CAST(ROUND(CAST(SUM(CASE WHEN is_winner = 1 THEN bidder_total ELSE 0 END) AS NUMERIC), 2) AS DOUBLE PRECISION) AS won_volume
-        FROM project_bids
+        FROM combined_project_bids
         GROUP BY contractor_id, contractor_name, approx_employees, az_roc_license
         ORDER BY wins DESC, total_bids DESC
     """
@@ -1040,6 +1144,17 @@ def get_all_contractors(
                 COUNT(DISTINCT project_id) AS itemized_bids,
                 COUNT(DISTINCT CASE WHEN is_winner = 1 THEN project_id END) AS itemized_wins,
                 COUNT(*) AS bid_line_count
+            FROM (
+                SELECT contractor_id, project_id, is_winner FROM bid_lines
+                WHERE is_engineers_estimate = 0 AND contractor_id IS NOT NULL
+                UNION ALL
+                SELECT pb.contractor_id, pb.project_id, pb.is_winner FROM project_bids pb
+                WHERE pb.is_engineers_estimate = 0 AND pb.contractor_id IS NOT NULL
+            ) all_b
+            GROUP BY contractor_id
+        ),
+        line_only_counts AS (
+            SELECT contractor_id, COUNT(*) AS true_line_count
             FROM bid_lines
             WHERE is_engineers_estimate = 0 AND contractor_id IS NOT NULL
             GROUP BY contractor_id
@@ -1053,10 +1168,11 @@ def get_all_contractors(
             COALESCE(a.awarded_project_volume, 0) AS awarded_volume,
             COALESCE(b.itemized_bids, 0) AS itemized_bids,
             COALESCE(b.itemized_wins, 0) AS itemized_wins,
-            COALESCE(b.bid_line_count, 0) AS bid_line_count
+            COALESCE(loc.true_line_count, 0) AS bid_line_count
         FROM contractors c
         LEFT JOIN awarded_stats a ON c.contractor_id = a.contractor_id
         LEFT JOIN bid_stats b ON c.contractor_id = b.contractor_id
+        LEFT JOIN line_only_counts loc ON c.contractor_id = loc.contractor_id
         WHERE 1=1
     """
     params: list[Any] = []
@@ -1178,6 +1294,14 @@ def get_contractor_details(
                   AND is_winner = 1
                 GROUP BY project_id
             ),
+            summary_winners AS (
+                SELECT project_id, MAX(bid_total) AS bidder_total
+                FROM project_bids
+                WHERE contractor_id = ?
+                  AND is_engineers_estimate = 0
+                  AND is_winner = 1
+                GROUP BY project_id
+            ),
             all_lines AS (
                 SELECT project_id, COUNT(*) AS line_count
                 FROM bid_lines
@@ -1192,19 +1316,50 @@ def get_contractor_details(
                 p.county,
                 p.letting_date,
                 p.engineers_estimate,
-                COALESCE(p.winning_bid_total, lw.bidder_total) AS winning_bid_total,
+                COALESCE(p.winning_bid_total, lw.bidder_total, sw.bidder_total) AS winning_bid_total,
                 COALESCE(al.line_count, 0) AS bid_line_count,
                 p.source_url
             FROM projects p
             LEFT JOIN line_winners lw ON p.project_id = lw.project_id
+            LEFT JOIN summary_winners sw ON p.project_id = sw.project_id
             LEFT JOIN all_lines al ON p.project_id = al.project_id
-            WHERE p.awarded_contractor_id = ? OR lw.project_id IS NOT NULL
+            WHERE p.awarded_contractor_id = ? OR lw.project_id IS NOT NULL OR sw.project_id IS NOT NULL
             ORDER BY CASE WHEN p.letting_date IS NULL OR p.letting_date = '' THEN 1 ELSE 0 END,
                      p.letting_date DESC, p.project_id DESC
         """
-        won_df = conn.query_df(won_sql, [cid, cid, cid])
+        won_df = conn.query_df(won_sql, [cid, cid, cid, cid])
 
         bids_sql = """
+            WITH line_proj_bids AS (
+                SELECT
+                    bl.project_id,
+                    SUM(bl.extended_total) AS bidder_total,
+                    MIN(bl.bid_rank) AS bid_rank,
+                    MAX(bl.is_winner) AS is_winner,
+                    COUNT(*) AS bid_line_count
+                FROM bid_lines bl
+                WHERE bl.contractor_id = ? AND bl.is_engineers_estimate = 0
+                GROUP BY bl.project_id
+            ),
+            summary_proj_bids AS (
+                SELECT
+                    pb.project_id,
+                    pb.bid_total AS bidder_total,
+                    pb.bid_rank,
+                    pb.is_winner,
+                    0 AS bid_line_count
+                FROM project_bids pb
+                WHERE pb.contractor_id = ?
+                  AND pb.is_engineers_estimate = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM line_proj_bids lp WHERE lp.project_id = pb.project_id
+                  )
+            ),
+            combined AS (
+                SELECT * FROM line_proj_bids
+                UNION ALL
+                SELECT * FROM summary_proj_bids
+            )
             SELECT
                 p.project_id,
                 p.agency,
@@ -1213,23 +1368,20 @@ def get_contractor_details(
                 p.county,
                 p.letting_date,
                 p.engineers_estimate,
-                SUM(bl.extended_total) AS bidder_total,
+                c.bidder_total,
                 CAST(ROUND(CAST(CASE WHEN p.engineers_estimate > 0
-                    THEN 100.0 * (SUM(bl.extended_total) - p.engineers_estimate) / p.engineers_estimate
+                    THEN 100.0 * (c.bidder_total - p.engineers_estimate) / p.engineers_estimate
                     ELSE NULL END AS NUMERIC), 2) AS DOUBLE PRECISION) AS pct_vs_ee,
-                MIN(bl.bid_rank) AS bid_rank,
-                MAX(bl.is_winner) AS is_winner,
-                COUNT(*) AS bid_line_count,
+                c.bid_rank,
+                c.is_winner,
+                c.bid_line_count,
                 p.source_url
-            FROM bid_lines bl
-            JOIN projects p ON bl.project_id = p.project_id
-            WHERE bl.contractor_id = ? AND bl.is_engineers_estimate = 0
-            GROUP BY p.project_id, p.agency, p.agency_project_num, p.title, p.county,
-                     p.letting_date, p.engineers_estimate, p.source_url
+            FROM combined c
+            JOIN projects p ON c.project_id = p.project_id
             ORDER BY CASE WHEN p.letting_date IS NULL OR p.letting_date = '' THEN 1 ELSE 0 END,
                      p.letting_date DESC, p.project_id DESC
         """
-        bids_df = conn.query_df(bids_sql, [cid])
+        bids_df = conn.query_df(bids_sql, [cid, cid])
 
         items_sql = """
             SELECT

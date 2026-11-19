@@ -55,7 +55,7 @@ def test_adot_pdf_discovery_and_dry_run_sync(tmp_path: Path):
     links = discover_adot_bid_tab_pdfs(session=mock_sess)
     assert len(links) == 2
     assert links[0]["project_num"] == "F051201C"
-    assert links[0]["url"] == "https://azdot.gov/files/bidtabs/F051201C_bidtab.pdf"
+    assert links[0]["url"] == "https://cnsads.azdot.gov/files/bidtabs/F051201C_bidtab.pdf"
 
     db_path = tmp_path / "test_adot_sync.db"
     init_db(db_path)
@@ -809,5 +809,346 @@ def test_bidsync_primefaces_ajax_pagination():
     assert [l.project_num for l in listings] == ["220014-DBB", "230049-DBB"]
     assert "ac=awgroupreview" in listings[1].tab_url
     assert "expandall=Y" in listings[1].tab_url
+
+
+def test_adot_wayback_stb_and_as_read_archives(tmp_path: Path):
+    from unittest.mock import MagicMock, patch
+
+    from src.db import db_session, init_db
+    from src.scrapers.adot_archive import (
+        ADOT_AS_READ_DETAIL_URL,
+        ADOT_AS_READ_INDEX_URL,
+        STB_MEETING_DOCS_URL,
+        WAYBACK_CDX_URL,
+        discover_wayback_tabulation_pdfs,
+        parse_as_read_detail_html,
+        parse_stb_awards_pdf,
+        sync_adot_as_read_history,
+        sync_adot_stb_awards,
+    )
+
+    # 1. Wayback CDX skips dead adot-cmss3bp00001 and keeps live azdotproductiondefault S3 PDFs
+    wb_html = """
+    <html><body>
+      <table>
+        <tr><td>010 MA 001 F012301C</td><td><a href="https://azdotproductiondefault-adotcloud-prod-s3-files.s3.us-west-2.amazonaws.com/document/f012301c.pdf">Tab</a></td></tr>
+        <tr><td>010 MA 001 H888801C</td><td><a href="https://adot-cmss3bp00001.s3.amazonaws.com/old.pdf">Old</a></td></tr>
+      </table>
+    </body></html>
+    """
+    cdx_resp = MagicMock(
+        ok=True,
+        json=lambda: [
+            ["timestamp", "original", "statuscode", "digest"],
+            ["20240501120000", "https://cnsads.azdot.gov/tabulations", "200", "ABC"],
+        ],
+    )
+    cdx_resp.raise_for_status = MagicMock()
+    snap_resp = MagicMock(ok=True, status_code=200, text=wb_html)
+
+    wb_sess = MagicMock()
+    wb_sess.headers = {}
+    wb_sess.get.side_effect = lambda url, **kw: cdx_resp if WAYBACK_CDX_URL in url else snap_resp
+    found = discover_wayback_tabulation_pdfs(session=wb_sess, delay_seconds=0.0)
+    assert len(found) == 1
+    assert found[0]["project_num"] == "F012301C"
+    assert "azdotproductiondefault" in found[0]["pdf_url"]
+
+    # 2. ADOT As-Read detail HTML parser + sync
+    as_read_html = """
+    <html><body>
+      <h2>As-Read Bid Results</h2>
+      <p>0000 YV YYV T041401C YYV-0-(212)T YAVAPAI COUNTY (Wash Bridge)</p>
+      <p>NorthWest District</p>
+      <p>Bid Opening: 9/5/2025 11:00:00 AM</p>
+      <table>
+        <tr><th>Bid Amount</th><th>Contractor Name</th><th>Contractor Address</th></tr>
+        <tr><td>$891,050.00</td><td>DEPARTMENT</td><td>PHOENIX, AZ</td></tr>
+        <tr><td>$1,032,972.60</td><td>C S CONSTRUCTION, INC.</td><td>PHOENIX, AZ</td></tr>
+        <tr><td>$1,168,213.60</td><td>STANDARD CONSTRUCTION COMPANY, INC.</td><td>AVONDALE, AZ</td></tr>
+      </table>
+    </body></html>
+    """
+    parsed_ar = parse_as_read_detail_html(
+        as_read_html,
+        detail_id="2025001",
+        source_url="https://cnsads.azdot.gov/as-read/details/2025001",
+    )
+    assert parsed_ar is not None
+    assert parsed_ar.tracs_num == "T041401C"
+    assert parsed_ar.county == "Yavapai"
+    assert parsed_ar.district == "NorthWest District"
+    assert parsed_ar.letting_date == "2025-09-05"
+    assert parsed_ar.engineers_estimate == 891050.0
+    assert len(parsed_ar.bidders) == 3
+
+    idx_html = '<html><body><table><tr><td><a href="/as-read/details/2025001">View</a></td></tr></table></body></html>'
+    err_html = "<html><body>Application Error Occurred</body></html>"
+
+    def _ar_get(url, **kw):
+        if url == ADOT_AS_READ_INDEX_URL:
+            return MagicMock(ok=True, text=idx_html)
+        if url == ADOT_AS_READ_DETAIL_URL.format(detail_id="2025001"):
+            return MagicMock(ok=True, text=as_read_html)
+        return MagicMock(ok=True, text=err_html)
+
+    ar_sess = MagicMock()
+    ar_sess.headers = {}
+    ar_sess.get.side_effect = _ar_get
+
+    db_path = tmp_path / "adot_archives.db"
+    init_db(db_path)
+    ar_res = sync_adot_as_read_history(
+        db_path,
+        start_year=2025,
+        end_year=2025,
+        max_seq_per_year=3,
+        max_consecutive_misses=2,
+        limit=10,
+        session=ar_sess,
+    )
+    assert ar_res["ingested_projects"] == 1
+    assert ar_res["ingested_project_bids"] == 3
+
+    # 3. STB Awards PDF parser + sync (mocking pdfplumber table output cleanly)
+    mock_page = MagicMock()
+    mock_page.extract_tables.return_value = [
+        [
+            ["DESCRIPTION OF WORK", "TRACS #\nPROJCT #", "LOW BIDDER", "BOARD ACTION"],
+            [
+                "Install Dynamic Message Signs on I-40 in Yavapai County",
+                "040 YV 140 F070301C\n040-B-(233)T",
+                "SUNDT CONSTRUCTION, INC.",
+                "AWARD\n$ 1,316,995.00",
+            ],
+            [
+                "Deferred project should be skipped",
+                "010 MA 100 F099901C\n010-A-(200)T",
+                "SOME BIDDER",
+                "DEFER",
+            ],
+        ]
+    ]
+    mock_pdf = MagicMock()
+    mock_pdf.pages = [mock_page]
+    mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
+    mock_pdf.__exit__ = MagicMock(return_value=False)
+
+    with patch("src.scrapers.adot_archive.pdfplumber.open", return_value=mock_pdf):
+        awards = parse_stb_awards_pdf(
+            b"%PDF-mock",
+            meeting_date="2026-10-16",
+            source_url="https://aztransportationboard.gov/sites/default/files/Awards-2026101626.pdf",
+        )
+    assert len(awards) == 1
+    assert awards[0].tracs_num == "F070301C"
+    assert awards[0].award_amount == 1316995.0
+    assert awards[0].county == "Yavapai"
+
+    stb_docs_html = '<html><body><a href="/meeting-awards/1748">Oct 2026</a></body></html>'
+    stb_award_html = '<html><body><a href="/sites/default/files/Awards-2026101626.pdf">Awards</a></body></html>'
+
+    def _stb_get(url, **kw):
+        if url.startswith(STB_MEETING_DOCS_URL) and "page=" not in url:
+            return MagicMock(ok=True, text=stb_docs_html)
+        if "meeting-awards/1748" in url:
+            return MagicMock(ok=True, text=stb_award_html)
+        if url.endswith(".pdf"):
+            return MagicMock(ok=True, content=b"%PDF-mock")
+        return MagicMock(ok=True, text="<html></html>")
+
+    stb_sess = MagicMock()
+    stb_sess.headers = {}
+    stb_sess.get.side_effect = _stb_get
+
+    with patch("src.scrapers.adot_archive.pdfplumber.open", return_value=mock_pdf):
+        stb_res = sync_adot_stb_awards(db_path, max_pages=2, limit=10, session=stb_sess)
+    assert stb_res["ingested_projects"] == 1
+
+    with db_session(db_path) as conn:
+        proj_count = conn.execute("SELECT COUNT(*) FROM projects WHERE agency = 'ADOT'").fetchone()[0]
+        pb_count = conn.execute("SELECT COUNT(*) FROM project_bids").fetchone()[0]
+    assert proj_count == 2
+    assert pb_count == 4
+
+
+def test_bidsync_step50_and_lump_sum_plus_maricopa_onbase(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from src.db import db_session, init_db
+    from src.scrapers.maricopa_bidsync import (
+        BIDSYNC_MARICOPA_SEARCH_URL,
+        BIDSYNC_SEARCH_POST_URL,
+        fetch_bidsync_listings,
+        parse_bidsync_tab_with_totals,
+        run_maricopa_bidsync_sync,
+    )
+    from src.scrapers.maricopa_onbase import (
+        ONBASE_FULLTEXT_URL,
+        ONBASE_KEYWORD_SEARCH_URL,
+        run_maricopa_onbase_sync,
+    )
+
+    # 1. Verify full 46-row PrimeFaces AJAX page advances first_offset by +50 (10 -> 60), NOT +46
+    rows_46 = "\n".join(
+        f"""<tr>
+          <td>240{i:03d}-DBB</td><td>Roadway Paving Segment {i}</td><td>Maricopa County</td>
+          <td>Arizona</td><td>Jan 15, 2024 2:00:00 PM MST</td><td>Bid has ended</td>
+          <td><a href="https://www.bidsync.com/DPX?ac=awgroupreview&auc={3000+i}&supsrch=">Tab</a></td>
+        </tr>"""
+        for i in range(46)
+    )
+    page0_html = """
+    <html><body>
+      <form id="elasticBidSearchForm">
+        <input type="hidden" name="javax.faces.ViewState" value="vs-0" />
+        <input type="text" name="elasticBidSearchForm:bidSearchParametersComponent:j_idt323" value="" />
+      </form>
+      <table></table>
+    </body></html>
+    """
+    ajax_page1 = f"""<?xml version="1.0" encoding="utf-8"?>
+    <partial-response><changes>
+      <update id="elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults"><![CDATA[
+        <table>{rows_46}</table>
+      ]]></update>
+      <update id="j_id1:javax.faces.ViewState:0"><![CDATA[vs-1]]></update>
+    </changes></partial-response>
+    """
+    ajax_page2_empty = """<?xml version="1.0" encoding="utf-8"?>
+    <partial-response><changes>
+      <update id="elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults"><![CDATA[<table></table>]]></update>
+    </changes></partial-response>
+    """
+
+    posted_first_offsets: list[str] = []
+
+    def _bidsync_post(url, data=None, **kw):
+        if isinstance(data, dict) and "elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults_first" in data:
+            posted_first_offsets.append(
+                data["elasticBidSearchForm:bidSearchParametersComponent:linksBidSearchResults_first"]
+            )
+            return MagicMock(
+                ok=True,
+                text=ajax_page1 if len(posted_first_offsets) == 1 else ajax_page2_empty,
+            )
+        return MagicMock(ok=True, text=page0_html, raise_for_status=MagicMock())
+
+    bs_sess = MagicMock()
+    bs_sess.headers = {}
+    bs_sess.get.return_value = MagicMock(ok=True, text=page0_html, raise_for_status=MagicMock())
+    bs_sess.post.side_effect = _bidsync_post
+    listings = fetch_bidsync_listings(limit=100, query="", max_ajax_pages=5, session=bs_sess)
+    assert len(listings) == 46
+    assert posted_first_offsets == ["10", "60"]
+
+    # 2. Verify lump-sum BidSync page (no unit-price rows) saves totals into project_bids
+    lump_sum_html = """
+    <html><body>
+      <table>
+        <tr>
+          <td><img alt="Awarded" /></td><td><img alt="Click to open supplier bid information" /></td>
+          <td>SUNLAND ASPHALT</td>
+        </tr>
+        <tr><td>TOTAL PRICE:</td><td>$425,000.00</td></tr>
+        <tr>
+          <td><img alt="Click to open supplier bid information" /></td>
+          <td>MARKHAM CONTRACTING</td>
+        </tr>
+        <tr><td>TOTAL PRICE:</td><td>$460,500.00</td></tr>
+      </table>
+    </body></html>
+    """
+    parsed_ls, totals_ls = parse_bidsync_tab_with_totals(
+        lump_sum_html,
+        project_num="240001-JOC",
+        title="Asphalt Overlay JOC",
+        letting_date="2024-02-01",
+    )
+    assert parsed_ls.lines == []
+    assert parsed_ls.awarded_contractor == "SUNLAND ASPHALT"
+    assert parsed_ls.winning_bid_total == 425000.0
+    assert totals_ls == [("SUNLAND ASPHALT", 425000.0, True), ("MARKHAM CONTRACTING", 460500.0, False)]
+
+    search_one_ls = """
+    <html><body>
+      <form id="elasticBidSearchForm"><input type="hidden" name="javax.faces.ViewState" value="vs-0" /></form>
+      <table><tr>
+        <td>240001-JOC</td><td>Asphalt Overlay JOC</td><td>Maricopa County</td>
+        <td>Arizona</td><td>Feb 01, 2024 2:00:00 PM MST</td><td>Bid has ended</td>
+        <td><a href="https://www.bidsync.com/DPX?ac=awgroupreview&auc=4001&supsrch=">Tab</a></td>
+      </tr></table>
+    </body></html>
+    """
+    ls_sess = MagicMock()
+    ls_sess.headers = {}
+    ls_sess.get.side_effect = lambda url, **kw: (
+        MagicMock(ok=True, text=search_one_ls, raise_for_status=MagicMock())
+        if url == BIDSYNC_MARICOPA_SEARCH_URL
+        else MagicMock(ok=True, text=lump_sum_html, url=url)
+    )
+    ls_sess.post.return_value = MagicMock(ok=True, text=ajax_page2_empty)
+
+    db_path = tmp_path / "maricopa_all.db"
+    init_db(db_path)
+    bs_res = run_maricopa_bidsync_sync(db_path, limit=10, query="", max_ajax_pages=2, session=ls_sess)
+    assert bs_res["ingested"] == 1
+    assert bs_res["ingested_summary_only"] == 1
+    assert bs_res["total_project_bids"] == 2
+
+    # 3. Verify Maricopa OnBase scraper filters out non-civil contracts and ingests civil ones
+    def _ob_post(url, json=None, **kw):
+        if url == ONBASE_KEYWORD_SEARCH_URL:
+            return MagicMock(
+                ok=True,
+                json=lambda: {
+                    "Data": [
+                        {
+                            "ID": "DOC-1",
+                            "Name": "OPS - Contract Supplemental Docs - 250045 - INTELLIGENT TRANSIT SIGNAL PROJECT - PRICING - ROADSAFE TRAFFIC",
+                            "DisplayColumnValues": [
+                                {"Value": "Name"},
+                                {"Value": "ROADSAFE TRAFFIC SYSTEMS"},
+                                {"Value": "4/30/2026"},
+                            ],
+                        }
+                    ]
+                },
+            )
+        if url == ONBASE_FULLTEXT_URL and json and json.get("SearchText") == "MCDOT":
+            return MagicMock(
+                ok=True,
+                json=lambda: {
+                    "Data": [
+                        {
+                            "ID": "DOC-1",
+                            "Name": "OPS - County Contracts - 250045 - INTELLIGENT TRANSIT SIGNAL PROJECT",
+                            "Summary": "MCDOT Project TE073 AWARDED $1,250,000.00",
+                        },
+                        {
+                            "ID": "DOC-2",
+                            "Name": "OPS - County Contracts - 250009 - AMMUNITION AND LESS LETHAL MUNITIONS",
+                            "Summary": "Sheriff Office ammunition contract",
+                        },
+                    ]
+                },
+            )
+        return MagicMock(ok=True, json=lambda: {"Data": []})
+
+    ob_sess = MagicMock()
+    ob_sess.headers = {}
+    ob_sess.post.side_effect = _ob_post
+    ob_res = run_maricopa_onbase_sync(db_path, limit=50, session=ob_sess)
+    assert ob_res["discovered"] == 1
+    assert ob_res["ingested"] == 1
+    assert ob_res["with_vendor"] == 1
+    assert ob_res["with_amount"] == 1
+
+    with db_session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT agency_project_num, winning_bid_total FROM projects ORDER BY agency_project_num"
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [("240001-JOC", 425000.0), ("250045", 1250000.0)]
+
 
 

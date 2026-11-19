@@ -18,6 +18,7 @@ on:
           - playwright
           - dry-run
           - requests
+          - backfill
 
 jobs:
   archive-bidtabs:
@@ -40,7 +41,7 @@ jobs:
         run: pytest -v
 
       - name: Install Chromium for Playwright
-        if: ${{ github.event.inputs.mode != 'requests' }}
+        if: ${{ github.event.inputs.mode != 'requests' && github.event.inputs.mode != 'backfill' }}
         run: |
           if [ -z "${{ secrets.BROWSER_WS_ENDPOINT }}" ]; then
             playwright install chromium --with-deps
@@ -59,7 +60,7 @@ jobs:
           fi
 
       - name: Run ADOT Cloud Browser Sync (Playwright / CDP / Proxy -> Neon)
-        if: ${{ github.event.inputs.mode != 'requests' }}
+        if: ${{ github.event.inputs.mode != 'requests' && github.event.inputs.mode != 'backfill' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           BROWSER_WS_ENDPOINT: ${{ secrets.BROWSER_WS_ENDPOINT }}
@@ -79,6 +80,7 @@ jobs:
           python scripts/sync_adot_browser.py --headless --limit "$LIMIT" --wait 10 $EXTRA_FLAGS
 
       - name: Run Phoenix OpenGov & HTTP Sync
+        if: ${{ github.event.inputs.mode != 'backfill' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
@@ -88,4 +90,12 @@ jobs:
             EXTRA_FLAGS="--dry-run"
           fi
           python scripts/archive_weekly.py --limit "$LIMIT" $EXTRA_FLAGS
+
+      - name: Run Historical Archive Backfill (ADOT + Maricopa + Muni)
+        if: ${{ github.event.inputs.mode == 'backfill' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '500' }}"
+          python scripts/backfill_archives.py --all --limit "$LIMIT"
 

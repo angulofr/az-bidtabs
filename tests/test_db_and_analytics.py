@@ -483,6 +483,118 @@ def test_get_contractor_details_wins_and_bids(tmp_path: Path):
     assert len(details["top_items_df"]) == 1
 
 
+def test_project_bids_summary_table_deduplication_and_details(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_all_contractors,
+        get_contractor_details,
+        get_contractor_scorecard,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+        upsert_project_bid,
+    )
+
+    db_path = tmp_path / "project_bids_union.db"
+    init_db(db_path)
+
+    with db_session(db_path) as conn:
+        cid_winner = upsert_contractor(conn, "C S CONSTRUCTION, INC.")
+        cid_runner = upsert_contractor(conn, "STANDARD CONSTRUCTION COMPANY, INC.")
+
+        # 1. Summary-only As-Read project stored only in project_bids
+        p_summary = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F099901C",
+            title="DMS Sign Installation",
+            county="Yavapai",
+            letting_date="2025-09-05",
+            engineers_estimate=891050.0,
+            winning_bid_total=1032972.60,
+            awarded_contractor_id=cid_winner,
+        )
+        upsert_project_bid(
+            conn,
+            project_id=p_summary,
+            contractor_id=None,
+            is_engineers_estimate=True,
+            bid_total=891050.0,
+        )
+        upsert_project_bid(
+            conn,
+            project_id=p_summary,
+            contractor_id=cid_winner,
+            is_engineers_estimate=False,
+            bid_total=1032972.60,
+            bid_rank=1,
+            is_winner=True,
+        )
+        upsert_project_bid(
+            conn,
+            project_id=p_summary,
+            contractor_id=cid_runner,
+            is_engineers_estimate=False,
+            bid_total=1168213.60,
+            bid_rank=2,
+            is_winner=False,
+        )
+
+        # 2. Itemized project that ALSO has project_bids row -> must NOT double count
+        p_both = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F099801C",
+            title="I-10 Paving",
+            county="Maricopa",
+            letting_date="2026-01-10",
+            winning_bid_total=100000.0,
+            awarded_contractor_id=cid_winner,
+        )
+        item_id = upsert_pay_item(conn, "ADOT", "4090001", "AC PAVEMENT", "TON")
+        insert_bid_line(
+            conn,
+            project_id=p_both,
+            contractor_id=cid_winner,
+            is_engineers_estimate=False,
+            item_id=item_id,
+            quantity=1000.0,
+            unit_price=100.0,
+            bid_rank=1,
+            is_winner=True,
+        )
+        upsert_project_bid(
+            conn,
+            project_id=p_both,
+            contractor_id=cid_winner,
+            is_engineers_estimate=False,
+            bid_total=100000.0,
+            bid_rank=1,
+            is_winner=True,
+        )
+
+    all_c = get_all_contractors(db_path)
+    cs_row = all_c[all_c["contractor_name"] == "C S CONSTRUCTION"].iloc[0]
+    std_row = all_c[all_c["contractor_name"] == "STANDARD CONSTRUCTION"].iloc[0]
+    assert int(cs_row["itemized_bids"]) == 2
+    assert int(cs_row["itemized_wins"]) == 2
+    assert int(std_row["itemized_bids"]) == 1
+    assert int(std_row["itemized_wins"]) == 0
+
+    sc = get_contractor_scorecard(db_path)
+    sc_cs = sc[sc["contractor_name"] == "C S CONSTRUCTION"].iloc[0]
+    assert int(sc_cs["total_bids"]) == 2
+    assert int(sc_cs["wins"]) == 2
+
+    det = get_contractor_details("C S CONSTRUCTION", db_path)
+    assert det["summary"]["total_bids_submitted"] == 2
+    assert len(det["all_bids_df"]) == 2
+    assert det["summary"]["total_won_volume"] == 1132972.60
+
+
+
 
 
 
