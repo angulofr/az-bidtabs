@@ -7,6 +7,8 @@ Supports unauthenticated JSON endpoints exposed by Bonfire municipal portals:
 - City of Tempe (`tempe-gov.bonfirehub.com`)
 - City of Peoria (`peoriaaz.bonfirehub.com`)
 - City of Buckeye (`buckeyeaz.bonfirehub.com`)
+- City of Yuma (`yumaaz.bonfirehub.com`)
+- Maricopa County Community College District (`maricopa.bonfirehub.com`)
 """
 
 from __future__ import annotations
@@ -74,6 +76,18 @@ BONFIRE_PORTALS: dict[str, BonfirePortalConfig] = {
         key="buckeye",
         agency="City of Buckeye",
         base_url="https://buckeyeaz.bonfirehub.com",
+        county="Maricopa",
+    ),
+    "yuma": BonfirePortalConfig(
+        key="yuma",
+        agency="City of Yuma",
+        base_url="https://yumaaz.bonfirehub.com",
+        county="Yuma",
+    ),
+    "maricopa_ccd": BonfirePortalConfig(
+        key="maricopa_ccd",
+        agency="Maricopa Community Colleges",
+        base_url="https://maricopa.bonfirehub.com",
         county="Maricopa",
     ),
 }

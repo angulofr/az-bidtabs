@@ -23,6 +23,8 @@ on:
 jobs:
   archive-bidtabs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -98,4 +100,12 @@ jobs:
         run: |
           LIMIT="${{ github.event.inputs.limit || '500' }}"
           python scripts/backfill_archives.py --all --limit "$LIMIT"
+
+      - name: Publish Archived PDFs to GitHub Releases
+        if: ${{ github.event.inputs.mode != 'dry-run' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/upload_pdfs_to_releases.py
 

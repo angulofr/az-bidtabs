@@ -619,6 +619,93 @@ def test_app_hot_reload_recovers_stale_src_db_and_boots(tmp_path: Path, monkeypa
     assert hasattr(importlib.reload(maricopa_bidsync), "run_maricopa_bidsync_sync")
 
 
+def test_project_documents_and_get_project_details(tmp_path: Path):
+    from src.db import (
+        db_session,
+        get_all_projects,
+        get_project_details,
+        init_db,
+        insert_bid_line,
+        upsert_contractor,
+        upsert_pay_item,
+        upsert_project,
+        upsert_project_bid,
+        upsert_project_document,
+    )
+    from src.pdf_archive import save_pdf_artifact
+
+    db_path = tmp_path / "project_docs_detail.db"
+    init_db(db_path)
+
+    artifact = save_pdf_artifact(
+        b"%PDF-1.4\nmock pdf content",
+        bucket="adot",
+        filename_hint="F099001C_bidtab.pdf",
+        source_url="https://example.com/F099001C.pdf",
+        pdf_dir=tmp_path / "pdfs",
+    )
+    assert artifact is not None
+    assert artifact["bucket"] == "adot"
+    assert artifact["asset_name"].startswith("adot_F099001C_bidtab_")
+
+    with db_session(db_path) as conn:
+        cid = upsert_contractor(conn, "AMES CONSTRUCTION, INC.")
+        pid = upsert_project(
+            conn,
+            agency="ADOT",
+            agency_project_num="F099001C",
+            title="I-17 Bridge Widening",
+            county="Maricopa",
+            letting_date="2025-10-01",
+            engineers_estimate=100000.0,
+            winning_bid_total=95000.0,
+            awarded_contractor_id=cid,
+            source_url="https://example.com/F099001C.pdf",
+        )
+        upsert_project_document(
+            conn,
+            project_id=pid,
+            doc_type="bid_tab_pdf",
+            title="I-17 Bid Tabulation",
+            source_url=artifact["source_url"],
+            archive_url="https://github.com/angulofr/az-bidtabs/releases/download/pdf-archive-adot/" + artifact["asset_name"],
+            local_path=artifact["local_path"],
+            bucket=artifact["bucket"],
+            asset_name=artifact["asset_name"],
+            sha256=artifact["sha256"],
+            file_size=artifact["file_size"],
+        )
+        upsert_project_bid(
+            conn,
+            project_id=pid,
+            contractor_id=cid,
+            is_engineers_estimate=False,
+            bid_total=95000.0,
+            bid_rank=1,
+            is_winner=True,
+        )
+        item_id = upsert_pay_item(conn, "ADOT", "2030301", "ROADWAY EXCAVATION", "CU.YD.")
+        insert_bid_line(
+            conn,
+            project_id=pid,
+            contractor_id=cid,
+            is_engineers_estimate=False,
+            item_id=item_id,
+            quantity=1000.0,
+            unit_price=95.0,
+            bid_rank=1,
+            is_winner=True,
+        )
+
+    all_p = get_all_projects(db_path)
+    assert int(all_p.iloc[0]["doc_count"]) == 1
+    assert "releases/download/pdf-archive-adot/" in str(all_p.iloc[0]["source_url"])
+
+    det = get_project_details(pid, db_path)
+    assert det["project"]["agency_project_num"] == "F099001C"
+    assert len(det["documents_df"]) == 1
+    assert len(det["bidders_df"]) == 1
+    assert len(det["lines_df"]) == 1
 
 
 

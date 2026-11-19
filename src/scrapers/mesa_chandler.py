@@ -15,6 +15,24 @@ from src.scrapers.bonfire import is_civil_project
 MESA_SOCRATA_URL = "https://citydata.mesaaz.gov/resource/dfcn-ivuc.json"
 APP_AZ_BROWSE_URL = "https://app.az.gov/page.aspx/en/rfp/request_browse_public"
 
+_MESA_EXTRA_CIVIL_KEYWORDS = (
+    "CRACK SEAL",
+    "SLURRY SEAL",
+    "CHIP SEAL",
+    "MANHOLE",
+    "FIRE HYDRANT",
+    "FIBER",
+    "PARKING LOT",
+    "AGGREGATE",
+    "RIPRAP",
+    "EXCAVAT",
+    "STRIPING",
+    "PAVEMENT",
+    "UNDERGROUND",
+    "CONDUIT",
+    "ROUNDABOUT",
+)
+
 _CHANDLER_CIVIL_COMMODITIES = (
     "HEAVY CONSTRUCTION",
     "HIGHWAY",
@@ -65,7 +83,7 @@ def fetch_mesa_solicitations(
         {"User-Agent": "AZ-BidTabs/1.0 (+https://azbidtabs.example; heavy-civil-intel)"}
     )
 
-    fetch_limit = max(limit * 6, 150) if civil_only else limit
+    fetch_limit = max(limit * 8, 2000) if civil_only else limit
     resp = sess.get(
         MESA_SOCRATA_URL,
         params={"$order": "creation_date DESC", "$limit": fetch_limit},
@@ -81,7 +99,11 @@ def fetch_mesa_solicitations(
         title = str(row.get("contract_description") or "").strip()
         if not proj_num or not title or proj_num in seen:
             continue
-        if civil_only and not is_civil_project(title):
+        upper_t = title.upper()
+        if civil_only and not (
+            is_civil_project(title)
+            or any(kw in upper_t for kw in _MESA_EXTRA_CIVIL_KEYWORDS)
+        ):
             continue
         seen.add(proj_num)
         cdate = str(row.get("creation_date") or "")[:10]
@@ -104,10 +126,11 @@ def fetch_chandler_solicitations(
     limit: int = 25,
     *,
     civil_only: bool = True,
+    max_pages: int = 12,
     timeout: int = 25,
     session: requests.Session | None = None,
 ) -> list[MunicipalSolicitation]:
-    """Fetch City of Chandler public solicitations from Arizona Procurement Portal (APP)."""
+    """Fetch City of Chandler public solicitations from Arizona Procurement Portal (APP), paginating cleanly."""
     sess = session or requests.Session()
     sess.headers.update(
         {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -117,11 +140,15 @@ def fetch_chandler_solicitations(
     init_resp.raise_for_status()
     init_soup = BeautifulSoup(init_resp.text, "html.parser")
 
-    data: dict[str, str] = {}
-    for inp in init_soup.select("form input"):
-        name = inp.get("name")
-        if name and inp.get("type") in (None, "hidden", "text"):
-            data[name] = inp.get("value") or ""
+    def _collect_form_data(page_soup: BeautifulSoup) -> dict[str, str]:
+        d: dict[str, str] = {}
+        for inp in page_soup.select("form input"):
+            name = inp.get("name")
+            if name and inp.get("type") in (None, "hidden", "text"):
+                d[name] = inp.get("value") or ""
+        return d
+
+    data = _collect_form_data(init_soup)
     data["body:x:selOrgaLevelOrgaNode_78E9FF04_1"] = "act;CYC"
     data["body_x_selOrgaLevelOrgaNode_78E9FF04_1_text"] = "City of Chandler"
     data["body:x:prxFilterBar:x:cmdSearchBtn"] = "Search"
@@ -130,50 +157,76 @@ def fetch_chandler_solicitations(
     post_resp.raise_for_status()
     soup = BeautifulSoup(post_resp.text, "html.parser")
 
-    grid = soup.find("table", {"id": "body_x_grid_grd"})
-    if grid is None:
-        return []
-
     results: list[MunicipalSolicitation] = []
     seen: set[str] = set()
-    for tr in grid.select("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 8:
-            continue
-        code = tds[1].get_text(" ", strip=True)
-        label = tds[2].get_text(" ", strip=True)
-        pub_begin = _parse_us_date(tds[3].get_text(" ", strip=True))
-        commodity = tds[4].get_text(" ", strip=True)
-        status = tds[7].get_text(" ", strip=True)
-        if not code or not label or code in seen:
-            continue
-        if civil_only:
-            comm_upper = commodity.upper()
-            if not (
-                is_civil_project(label)
-                or any(kw in comm_upper for kw in _CHANDLER_CIVIL_COMMODITIES)
-            ):
-                continue
-        seen.add(code)
-        link = tds[2].find("a", href=True) or tds[0].find("a", href=True)
-        href = str(link.get("href")) if link else ""
-        full_url = (
-            href
-            if href.startswith("http")
-            else f"https://app.az.gov{href}" if href else APP_AZ_BROWSE_URL
-        )
-        results.append(
-            MunicipalSolicitation(
-                agency="City of Chandler",
-                project_num=code,
-                title=label,
-                letting_date=pub_begin,
-                status=status,
-                url=full_url,
-            )
-        )
-        if len(results) >= limit:
+
+    for page_idx in range(max_pages):
+        grid = soup.find("table", {"id": "body_x_grid_grd"})
+        if grid is None:
             break
+
+        data_rows = [tr for tr in grid.select("tr") if len(tr.find_all("td")) >= 8]
+        if not data_rows:
+            break
+
+        new_codes_on_page = 0
+        for tr in data_rows:
+            tds = tr.find_all("td")
+            code = tds[1].get_text(" ", strip=True)
+            label = tds[2].get_text(" ", strip=True)
+            pub_begin = _parse_us_date(tds[3].get_text(" ", strip=True))
+            commodity = tds[4].get_text(" ", strip=True)
+            status = tds[7].get_text(" ", strip=True)
+            if not code or not label or code in seen:
+                continue
+            new_codes_on_page += 1
+            seen.add(code)
+            if civil_only:
+                comm_upper = commodity.upper()
+                if not (
+                    is_civil_project(label)
+                    or any(kw in comm_upper for kw in _CHANDLER_CIVIL_COMMODITIES)
+                ):
+                    continue
+            link = tds[2].find("a", href=True) or tds[0].find("a", href=True)
+            href = str(link.get("href")) if link else ""
+            full_url = (
+                href
+                if href.startswith("http")
+                else f"https://app.az.gov{href}" if href else APP_AZ_BROWSE_URL
+            )
+            results.append(
+                MunicipalSolicitation(
+                    agency="City of Chandler",
+                    project_num=code,
+                    title=label,
+                    letting_date=pub_begin,
+                    status=status,
+                    url=full_url,
+                )
+            )
+            if len(results) >= limit:
+                return results
+
+        # Stop if fewer than full 15-row page returned or no new rows seen
+        if len(data_rows) < 15 or new_codes_on_page == 0 or page_idx + 1 >= max_pages:
+            break
+
+        next_idx = page_idx + 1
+        pager_data = _collect_form_data(soup)
+        pager_data["body:x:selOrgaLevelOrgaNode_78E9FF04_1"] = "act;CYC"
+        pager_data["body_x_selOrgaLevelOrgaNode_78E9FF04_1_text"] = "City of Chandler"
+        pager_data["hdnCurrentPageIndexbody_x_grid_grd"] = str(next_idx)
+        pager_data["__EVENTTARGET"] = "body:x:grid:grd"
+        pager_data["__EVENTARGUMENT"] = f"Page|{next_idx}"
+        try:
+            next_resp = sess.post(APP_AZ_BROWSE_URL, data=pager_data, timeout=timeout)
+            if not next_resp.ok:
+                break
+            soup = BeautifulSoup(next_resp.text, "html.parser")
+        except requests.RequestException:
+            break
+
     return results
 
 

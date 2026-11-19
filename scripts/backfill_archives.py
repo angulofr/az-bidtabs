@@ -20,6 +20,7 @@ from src.scrapers.adot_archive import (
     sync_adot_stb_awards,
     sync_adot_wayback_pdfs,
 )
+from src.scrapers.bidnet_az import run_all_bidnet_syncs
 from src.scrapers.bonfire import run_all_bonfire_syncs
 from src.scrapers.maricopa_bidsync import run_maricopa_bidsync_sync
 from src.scrapers.maricopa_onbase import run_maricopa_onbase_sync
@@ -33,11 +34,13 @@ def _db_totals(db_path: str | None) -> dict[str, int]:
         contractors = conn.execute("SELECT COUNT(*) FROM contractors").fetchone()[0]
         bid_lines = conn.execute("SELECT COUNT(*) FROM bid_lines").fetchone()[0]
         project_bids = conn.execute("SELECT COUNT(*) FROM project_bids").fetchone()[0]
+        project_documents = conn.execute("SELECT COUNT(*) FROM project_documents").fetchone()[0]
     return {
         "projects": int(projects),
         "contractors": int(contractors),
         "bid_lines": int(bid_lines),
         "project_bids": int(project_bids),
+        "project_documents": int(project_documents),
     }
 
 
@@ -57,11 +60,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AZ BidTabs historical archive backfill")
     parser.add_argument("--all", action="store_true", help="Run all historical backfill sources")
     parser.add_argument("--adot-live", action="store_true", help="Run direct CNSADS tabulations sync")
-    parser.add_argument("--adot-wayback", action="store_true", help="Run Wayback -> live S3 ADOT PDF recovery")
+    parser.add_argument("--adot-wayback", action="store_true", help="Run Wayback + direct S3 CDX ADOT PDF recovery")
     parser.add_argument("--adot-stb", action="store_true", help="Run ADOT Transportation Board Awards PDFs (2010-2026)")
-    parser.add_argument("--adot-as-read", action="store_true", help="Run ADOT CNSADS As-Read history (2001-2026)")
+    parser.add_argument("--adot-as-read", action="store_true", help="Run ADOT CNSADS As-Read history (2000-2026)")
     parser.add_argument("--mcdot-bidsync", action="store_true", help="Run full unfiltered Maricopa BidSync walk")
-    parser.add_argument("--mcdot-onbase", action="store_true", help="Run Maricopa OnBase civil contracts sync")
+    parser.add_argument("--mcdot-onbase", action="store_true", help="Run Maricopa OnBase + Expiration PDF + PDF download")
+    parser.add_argument("--bidnet", action="store_true", help="Run BidNet Direct AZ portals (Maricopa/FCD/Pima/Avondale)")
     parser.add_argument("--municipal", action="store_true", help="Run Phoenix/Bonfire/Mesa/Chandler backfill")
     parser.add_argument("--limit", type=int, default=500, help="Base per-source limit")
     parser.add_argument("--dry-run", action="store_true", help="Discover/parse without DB writes")
@@ -77,6 +81,7 @@ def main() -> int:
             args.adot_as_read,
             args.mcdot_bidsync,
             args.mcdot_onbase,
+            args.bidnet,
             args.municipal,
         ]
     )
@@ -109,13 +114,15 @@ def main() -> int:
         )
 
     if args.all or args.adot_as_read:
-        as_read_limit = max(args.limit * 6, 3000)
+        as_read_limit = max(args.limit * 12, 6000)
         report["steps"]["adot_as_read_history"] = _run_step(
             "adot_as_read_history",
             lambda: sync_adot_as_read_history(
                 args.db,
-                start_year=2001,
+                start_year=2000,
                 end_year=2026,
+                max_seq_per_year=205,
+                max_consecutive_misses=25,
                 limit=as_read_limit,
                 dry_run=args.dry_run,
             ),
@@ -141,12 +148,21 @@ def main() -> int:
             lambda: run_maricopa_onbase_sync(
                 args.db,
                 limit=onbase_limit,
+                include_expiration_pdf=True,
+                fetch_contract_pdfs=True,
+                pdf_limit=150,
                 dry_run=args.dry_run,
             ),
         )
 
+    if args.all or args.bidnet:
+        report["steps"]["bidnet_az"] = _run_step(
+            "bidnet_az",
+            lambda: run_all_bidnet_syncs(args.db, limit=max(args.limit, 300), dry_run=args.dry_run),
+        )
+
     if args.all or args.municipal:
-        muni_limit = max(args.limit, 250)
+        muni_limit = max(args.limit, 350)
         report["steps"]["phoenix_opengov"] = _run_step(
             "phoenix_opengov",
             lambda: run_phoenix_opengov_sync(args.db, limit=muni_limit, dry_run=args.dry_run),

@@ -18,6 +18,7 @@ from src.contractor_profiles import backfill_contractor_profiles
 from src.db import init_db
 from src.scrapers.adot import run_adot_archive_sync
 from src.scrapers.adot_archive import sync_adot_as_read_history, sync_adot_stb_awards
+from src.scrapers.bidnet_az import run_all_bidnet_syncs
 from src.scrapers.bonfire import run_all_bonfire_syncs
 from src.scrapers.maricopa_bidsync import run_maricopa_bidsync_sync
 from src.scrapers.maricopa_onbase import run_maricopa_onbase_sync
@@ -39,6 +40,7 @@ def main() -> int:
         "adot_as_read_recent": None,
         "phoenix_opengov": None,
         "bonfire": None,
+        "bidnet_az": None,
         "mcdot_bidsync": None,
         "maricopa_onbase": None,
         "mesa": None,
@@ -88,10 +90,22 @@ def main() -> int:
 
     try:
         report["maricopa_onbase"] = run_maricopa_onbase_sync(
-            args.db, limit=max(args.limit, 50), dry_run=args.dry_run
+            args.db,
+            limit=max(args.limit, 50),
+            include_expiration_pdf=True,
+            fetch_contract_pdfs=True,
+            pdf_limit=25,
+            dry_run=args.dry_run,
         )
     except Exception as exc:
         report["maricopa_onbase"] = {"error": str(exc)}
+
+    try:
+        report["bidnet_az"] = run_all_bidnet_syncs(
+            args.db, limit=max(args.limit, 50), dry_run=args.dry_run
+        )
+    except Exception as exc:
+        report["bidnet_az"] = {"error": str(exc)}
 
     try:
         report["mesa"] = run_mesa_sync(args.db, limit=args.limit, dry_run=args.dry_run)

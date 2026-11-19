@@ -132,6 +132,22 @@ CREATE TABLE IF NOT EXISTS project_bids (
     is_winner INTEGER NOT NULL DEFAULT 0 CHECK (is_winner IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS project_documents (
+    doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    doc_type TEXT NOT NULL,
+    title TEXT,
+    source_url TEXT NOT NULL,
+    archive_url TEXT,
+    local_path TEXT,
+    bucket TEXT,
+    asset_name TEXT,
+    sha256 TEXT,
+    file_size INTEGER,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(project_id, doc_type, source_url)
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_agency ON projects(agency);
 CREATE INDEX IF NOT EXISTS idx_projects_county ON projects(county);
 CREATE INDEX IF NOT EXISTS idx_projects_letting ON projects(letting_date);
@@ -142,6 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_bid_lines_item ON bid_lines(item_id);
 CREATE INDEX IF NOT EXISTS idx_bid_lines_contractor ON bid_lines(contractor_id);
 CREATE INDEX IF NOT EXISTS idx_project_bids_project ON project_bids(project_id);
 CREATE INDEX IF NOT EXISTS idx_project_bids_contractor ON project_bids(contractor_id);
+CREATE INDEX IF NOT EXISTS idx_project_documents_project ON project_documents(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_documents_sha256 ON project_documents(sha256);
 """
 
 POSTGRES_STATEMENTS = [
@@ -218,6 +236,25 @@ POSTGRES_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_bids_project ON project_bids(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_bids_contractor ON project_bids(contractor_id)",
+    """
+    CREATE TABLE IF NOT EXISTS project_documents (
+        doc_id SERIAL PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        doc_type TEXT NOT NULL,
+        title TEXT,
+        source_url TEXT NOT NULL,
+        archive_url TEXT,
+        local_path TEXT,
+        bucket TEXT,
+        asset_name TEXT,
+        sha256 TEXT,
+        file_size INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(project_id, doc_type, source_url)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_documents_project ON project_documents(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_documents_sha256 ON project_documents(sha256)",
     "ALTER TABLE contractors ADD COLUMN IF NOT EXISTS approx_employees INTEGER",
 ]
 
@@ -419,13 +456,20 @@ def upsert_project(
         conn.execute(
             """
             UPDATE projects
-            SET title = ?, route_or_location = ?, county = ?, district = ?,
-                letting_date = ?, award_date = ?, engineers_estimate = ?,
-                winning_bid_total = ?, awarded_contractor_id = ?, source_url = ?
+            SET title = COALESCE(?, title),
+                route_or_location = COALESCE(?, route_or_location),
+                county = COALESCE(?, county),
+                district = COALESCE(?, district),
+                letting_date = COALESCE(?, letting_date),
+                award_date = COALESCE(?, award_date),
+                engineers_estimate = COALESCE(?, engineers_estimate),
+                winning_bid_total = COALESCE(?, winning_bid_total),
+                awarded_contractor_id = COALESCE(?, awarded_contractor_id),
+                source_url = COALESCE(?, source_url)
             WHERE project_id = ?
             """,
             (
-                title,
+                title or None,
                 route_or_location,
                 county,
                 district,
@@ -549,6 +593,67 @@ def upsert_project_bid(
         """,
         (project_id, cid, est_flag, float(bid_total), bid_rank, win_flag),
         "project_bid_id",
+    )
+
+
+def upsert_project_document(
+    conn: _DBConn,
+    *,
+    project_id: int,
+    doc_type: str,
+    source_url: str,
+    title: str | None = None,
+    archive_url: str | None = None,
+    local_path: str | None = None,
+    bucket: str | None = None,
+    asset_name: str | None = None,
+    sha256: str | None = None,
+    file_size: int | None = None,
+) -> int:
+    """Insert or update a PDF / external source document linked to a project."""
+    if not source_url:
+        raise ValueError("source_url is required for upsert_project_document")
+    existing = conn.execute(
+        "SELECT doc_id FROM project_documents WHERE project_id = ? AND doc_type = ? AND source_url = ?",
+        (project_id, doc_type.strip(), source_url.strip()),
+    ).fetchone()
+    if existing:
+        did = int(existing[0])
+        conn.execute(
+            """
+            UPDATE project_documents
+            SET title = COALESCE(?, title),
+                archive_url = COALESCE(?, archive_url),
+                local_path = COALESCE(?, local_path),
+                bucket = COALESCE(?, bucket),
+                asset_name = COALESCE(?, asset_name),
+                sha256 = COALESCE(?, sha256),
+                file_size = COALESCE(?, file_size)
+            WHERE doc_id = ?
+            """,
+            (title, archive_url, local_path, bucket, asset_name, sha256, file_size, did),
+        )
+        return did
+    return conn.insert_returning_id(
+        """
+        INSERT INTO project_documents (
+            project_id, doc_type, title, source_url, archive_url,
+            local_path, bucket, asset_name, sha256, file_size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            doc_type.strip(),
+            title,
+            source_url.strip(),
+            archive_url,
+            local_path,
+            bucket,
+            asset_name,
+            sha256,
+            int(file_size) if file_size is not None else None,
+        ),
+        "doc_id",
     )
 
 
@@ -1069,6 +1174,14 @@ def get_all_projects(
             SELECT project_id, COUNT(*) AS bid_line_count
             FROM bid_lines
             GROUP BY project_id
+        ),
+        doc_summary AS (
+            SELECT
+                project_id,
+                COUNT(*) AS doc_count,
+                MAX(archive_url) AS archive_url
+            FROM project_documents
+            GROUP BY project_id
         )
         SELECT
             p.project_id,
@@ -1082,10 +1195,12 @@ def get_all_projects(
             c.canonical_name AS awarded_contractor,
             c.approx_employees AS contractor_employees,
             COALESCE(lc.bid_line_count, 0) AS bid_line_count,
-            p.source_url
+            COALESCE(ds.doc_count, 0) AS doc_count,
+            COALESCE(ds.archive_url, p.source_url) AS source_url
         FROM projects p
         LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
         LEFT JOIN line_counts lc ON p.project_id = lc.project_id
+        LEFT JOIN doc_summary ds ON p.project_id = ds.project_id
         WHERE 1=1
     """
     params: list[Any] = []
@@ -1116,7 +1231,13 @@ def get_all_projects(
 
     with db_session(db_path) as conn:
         df = conn.query_df(sql, params)
-    for col in ["engineers_estimate", "winning_bid_total", "contractor_employees", "bid_line_count"]:
+    for col in [
+        "engineers_estimate",
+        "winning_bid_total",
+        "contractor_employees",
+        "bid_line_count",
+        "doc_count",
+    ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -1466,6 +1587,183 @@ def get_contractor_details(
         "all_bids_df": bids_df,
         "agency_breakdown_df": agency_df,
         "top_items_df": items_df,
+    }
+
+
+def get_project_details(
+    project_id: int,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return full details, saved PDFs/source documents, bidder rankings, and itemized lines for a project."""
+    pid = int(project_id)
+    with db_session(db_path) as conn:
+        proj_sql = """
+            SELECT
+                p.project_id,
+                p.agency,
+                p.agency_project_num,
+                p.title,
+                p.route_or_location,
+                p.county,
+                p.district,
+                p.letting_date,
+                p.award_date,
+                p.engineers_estimate,
+                p.winning_bid_total,
+                p.source_url,
+                c.canonical_name AS awarded_contractor,
+                c.az_roc_license AS contractor_roc_license,
+                c.approx_employees AS contractor_employees
+            FROM projects p
+            LEFT JOIN contractors c ON p.awarded_contractor_id = c.contractor_id
+            WHERE p.project_id = ?
+        """
+        proj_df = conn.query_df(proj_sql, [pid])
+        if proj_df.empty:
+            return {
+                "project": None,
+                "documents_df": pd.DataFrame(),
+                "bidders_df": pd.DataFrame(),
+                "lines_df": pd.DataFrame(),
+            }
+        project_info = proj_df.iloc[0].to_dict()
+
+        docs_sql = """
+            SELECT
+                doc_id,
+                doc_type,
+                title,
+                source_url,
+                archive_url,
+                local_path,
+                bucket,
+                asset_name,
+                file_size,
+                sha256
+            FROM project_documents
+            WHERE project_id = ?
+            ORDER BY CASE WHEN archive_url IS NOT NULL THEN 0 ELSE 1 END, doc_id ASC
+        """
+        docs_df = conn.query_df(docs_sql, [pid])
+        raw_src = project_info.get("source_url")
+        if raw_src and (
+            docs_df.empty
+            or str(raw_src) not in set(docs_df["source_url"].dropna().astype(str))
+        ):
+            fallback_row = pd.DataFrame(
+                [
+                    {
+                        "doc_id": None,
+                        "doc_type": "source_link",
+                        "title": "Primary Project Source",
+                        "source_url": str(raw_src),
+                        "archive_url": None,
+                        "local_path": None,
+                        "bucket": None,
+                        "asset_name": None,
+                        "file_size": None,
+                        "sha256": None,
+                    }
+                ]
+            )
+            docs_df = (
+                pd.concat([docs_df, fallback_row], ignore_index=True)
+                if not docs_df.empty
+                else fallback_row
+            )
+
+        bidders_sql = """
+            WITH itemized_totals AS (
+                SELECT
+                    bl.contractor_id,
+                    bl.is_engineers_estimate,
+                    MAX(bl.bid_rank) AS bid_rank,
+                    MAX(bl.is_winner) AS is_winner,
+                    COUNT(*) AS line_count,
+                    SUM(bl.extended_total) AS bid_total
+                FROM bid_lines bl
+                WHERE bl.project_id = ?
+                GROUP BY bl.contractor_id, bl.is_engineers_estimate
+            ),
+            summary_totals AS (
+                SELECT
+                    pb.contractor_id,
+                    pb.is_engineers_estimate,
+                    pb.bid_rank,
+                    pb.is_winner,
+                    0 AS line_count,
+                    pb.bid_total
+                FROM project_bids pb
+                WHERE pb.project_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bid_lines bl2
+                      WHERE bl2.project_id = pb.project_id
+                        AND bl2.is_engineers_estimate = pb.is_engineers_estimate
+                        AND COALESCE(bl2.contractor_id, -1) = COALESCE(pb.contractor_id, -1)
+                  )
+            ),
+            combined AS (
+                SELECT * FROM itemized_totals
+                UNION ALL
+                SELECT * FROM summary_totals
+            )
+            SELECT
+                CASE WHEN cb.is_engineers_estimate = 1 THEN 'ENGINEER''S ESTIMATE'
+                     ELSE COALESCE(c.canonical_name, 'UNKNOWN BIDDER') END AS bidder_name,
+                cb.is_engineers_estimate,
+                cb.bid_total,
+                CASE WHEN COALESCE(p.engineers_estimate, 0) > 0 AND cb.is_engineers_estimate = 0
+                     THEN CAST(ROUND(CAST(((cb.bid_total - p.engineers_estimate) / p.engineers_estimate) * 100.0 AS NUMERIC), 2) AS DOUBLE PRECISION)
+                     ELSE NULL END AS pct_vs_ee,
+                cb.bid_rank,
+                cb.is_winner,
+                cb.line_count,
+                c.approx_employees,
+                c.az_roc_license
+            FROM combined cb
+            JOIN projects p ON p.project_id = ?
+            LEFT JOIN contractors c ON cb.contractor_id = c.contractor_id
+            ORDER BY cb.is_engineers_estimate DESC,
+                     CASE WHEN cb.bid_rank IS NULL THEN 999 ELSE cb.bid_rank END ASC,
+                     cb.bid_total ASC
+        """
+        bidders_df = conn.query_df(bidders_sql, [pid, pid, pid])
+
+        lines_sql = """
+            SELECT
+                pi.spec_system,
+                pi.item_code,
+                pi.description,
+                pi.unit,
+                CASE WHEN bl.is_engineers_estimate = 1 THEN 'ENGINEER''S ESTIMATE'
+                     ELSE COALESCE(c.canonical_name, 'UNKNOWN') END AS bidder_name,
+                bl.is_engineers_estimate,
+                bl.quantity,
+                bl.unit_price,
+                bl.extended_total,
+                bl.bid_rank,
+                bl.is_winner
+            FROM bid_lines bl
+            JOIN pay_items pi ON bl.item_id = pi.item_id
+            LEFT JOIN contractors c ON bl.contractor_id = c.contractor_id
+            WHERE bl.project_id = ?
+            ORDER BY pi.item_code ASC, bl.is_engineers_estimate DESC,
+                     CASE WHEN bl.bid_rank IS NULL THEN 999 ELSE bl.bid_rank END ASC
+        """
+        lines_df = conn.query_df(lines_sql, [pid])
+
+    for col in ("bid_total", "pct_vs_ee", "bid_rank", "is_winner", "line_count", "approx_employees"):
+        if col in bidders_df.columns:
+            bidders_df[col] = pd.to_numeric(bidders_df[col], errors="coerce")
+    for col in ("quantity", "unit_price", "extended_total", "bid_rank", "is_winner"):
+        if col in lines_df.columns:
+            lines_df[col] = pd.to_numeric(lines_df[col], errors="coerce")
+
+    return {
+        "project": project_info,
+        "documents_df": docs_df,
+        "bidders_df": bidders_df,
+        "lines_df": lines_df,
     }
 
 

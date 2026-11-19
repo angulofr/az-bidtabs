@@ -20,6 +20,7 @@ def _reload_az_bidtabs_modules() -> None:
         "src",
         "src.normalize",
         "src.contractor_profiles",
+        "src.pdf_archive",
         "src.db",
         "src.matching",
         "src.seed",
@@ -28,6 +29,7 @@ def _reload_az_bidtabs_modules() -> None:
         "src.scrapers.bonfire",
         "src.scrapers.scottsdale_bonfire",
         "src.scrapers.adot_archive",
+        "src.scrapers.bidnet_az",
         "src.scrapers.maricopa_bidsync",
         "src.scrapers.maricopa_onbase",
         "src.scrapers.mesa_chandler",
@@ -70,6 +72,7 @@ from src.db import (
     get_head_to_head_opponents,
     get_item_code_details,
     get_overview_stats,
+    get_project_details,
     init_db,
     is_postgres,
     query_pay_item_observations,
@@ -279,6 +282,7 @@ def _with_clickable_item_links(
 def _clear_item_query_param() -> None:
     st.session_state.pop("overview_detail", None)
     st.session_state.pop("selected_contractor", None)
+    st.session_state.pop("selected_project_id", None)
     try:
         st.query_params.clear()
     except Exception:
@@ -300,6 +304,158 @@ def _render_contractor_selector_bar(names: list[str], key_prefix: str) -> None:
     if c_btn.button("View Company →", key=f"{key_prefix}_open_btn", use_container_width=True, disabled=not chosen):
         st.session_state["selected_contractor"] = chosen
         st.rerun()
+
+
+def _render_project_detail_page(project_id: int) -> None:
+    top_l, top_r = st.columns([4, 1.3])
+    with top_r:
+        if st.button("← Back", key="back_from_project_btn", use_container_width=True):
+            st.session_state.pop("selected_project_id", None)
+            st.session_state["project_table_ver"] = (
+                st.session_state.get("project_table_ver", 0) + 1
+            )
+            try:
+                if "project" in st.query_params:
+                    del st.query_params["project"]
+            except Exception:
+                pass
+            st.rerun()
+
+    details = get_project_details(project_id, DB_PATH)
+    proj = details.get("project")
+    if not proj:
+        with top_l:
+            st.title(f"Project #{project_id}")
+        st.warning("No details found for that project.")
+        return
+
+    with top_l:
+        st.title(f"{proj.get('agency_project_num') or project_id} — {proj.get('title') or ''}")
+        sub_parts = []
+        if proj.get("agency"):
+            sub_parts.append(f"🏛️ **{proj['agency']}**")
+        if proj.get("county"):
+            sub_parts.append(f"📍 {proj['county']} County")
+        if proj.get("district"):
+            sub_parts.append(str(proj["district"]))
+        if proj.get("route_or_location"):
+            sub_parts.append(f"🛣️ {proj['route_or_location']}")
+        if proj.get("letting_date"):
+            sub_parts.append(f"📅 Letting: {proj['letting_date']}")
+        if proj.get("award_date"):
+            sub_parts.append(f"🏆 Award: {proj['award_date']}")
+        st.caption(" • ".join(sub_parts) if sub_parts else "Arizona Heavy-Civil Solicitation / Contract")
+
+    bidders_df = details["bidders_df"]
+    lines_df = details["lines_df"]
+    docs_df = details["documents_df"]
+
+    comp_bidders = (
+        int((bidders_df["is_engineers_estimate"] == 0).sum())
+        if not bidders_df.empty
+        else 0
+    )
+    ee_val = proj.get("engineers_estimate")
+    win_val = proj.get("winning_bid_total")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Engineer's Estimate", f"${float(ee_val):,.0f}" if pd.notna(ee_val) and ee_val else "—")
+    m2.metric("Winning / Contract ($)", f"${float(win_val):,.0f}" if pd.notna(win_val) and win_val else "—")
+    m3.metric("Competing Bidders", f"{comp_bidders:,}")
+    m4.metric("Itemized Bid Lines", f"{len(lines_df):,}")
+
+    awarded_name = proj.get("awarded_contractor")
+    if awarded_name:
+        if st.button(f"🏢 Open Awarded Contractor Profile: {awarded_name}", key="open_awarded_contractor_btn"):
+            st.session_state["selected_contractor"] = str(awarded_name)
+            st.session_state.pop("selected_project_id", None)
+            st.rerun()
+
+    st.subheader("Saved PDFs & Source Documents")
+    if docs_df.empty:
+        st.caption("No source links or PDFs attached to this project yet.")
+    else:
+        for idx, drow in docs_df.iterrows():
+            dtype = str(drow.get("doc_type") or "document").replace("_", " ").title()
+            dtitle = str(drow.get("title") or dtype)
+            arch_url = drow.get("archive_url")
+            src_url = drow.get("source_url")
+            local_p = drow.get("local_path")
+            fsize = drow.get("file_size")
+            size_lbl = f" ({float(fsize) / 1024:,.0f} KB)" if pd.notna(fsize) and fsize else ""
+
+            c_info, c_arch, c_src = st.columns([3.0, 1.3, 1.3])
+            c_info.markdown(f"**{dtype}**{size_lbl} — {dtitle}")
+            if arch_url and str(arch_url).startswith("http"):
+                c_arch.link_button("📥 Open Saved PDF", str(arch_url), use_container_width=True)
+            elif local_p and Path(str(local_p)).is_file():
+                c_arch.download_button(
+                    "📥 Download PDF",
+                    data=Path(str(local_p)).read_bytes(),
+                    file_name=Path(str(local_p)).name,
+                    mime="application/pdf",
+                    key=f"dl_local_pdf_{project_id}_{idx}",
+                    use_container_width=True,
+                )
+            else:
+                c_arch.caption("External link only")
+            if src_url and str(src_url).startswith("http"):
+                c_src.link_button("🔗 Original Source", str(src_url), use_container_width=True)
+
+    tab_bidders, tab_sched = st.tabs(["🏢 Participating Bidders", "🧱 Itemized Schedule Lines"])
+    with tab_bidders:
+        if bidders_df.empty:
+            st.info("No bidder comparison rows recorded for this project.")
+        else:
+            show_b = bidders_df.copy()
+            show_b["is_winner"] = show_b["is_winner"].fillna(0).astype(bool)
+            show_b["is_engineers_estimate"] = show_b["is_engineers_estimate"].fillna(0).astype(bool)
+            st.dataframe(
+                show_b.drop(columns=["is_engineers_estimate"]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "bidder_name": "Bidder / Entity",
+                    "bid_total": st.column_config.NumberColumn("Total Bid ($)", format="$%,.2f"),
+                    "pct_vs_ee": st.column_config.NumberColumn("% vs. EE", format="%.2f%%"),
+                    "bid_rank": st.column_config.NumberColumn("Rank", format="%d"),
+                    "is_winner": st.column_config.CheckboxColumn("Winner"),
+                    "line_count": st.column_config.NumberColumn("Bid Lines", format="%d"),
+                    "approx_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
+                    "az_roc_license": "AZ ROC License",
+                },
+            )
+
+    with tab_sched:
+        if lines_df.empty:
+            st.info("Summary-only solicitation/award (no line-item schedule uploaded or published for this contract).")
+        else:
+            show_l = lines_df.copy()
+            show_l["is_winner"] = show_l["is_winner"].fillna(0).astype(bool)
+            show_l = _with_clickable_item_links(show_l, "item_code", "spec_system")
+            st.dataframe(
+                show_l.drop(columns=["is_engineers_estimate"]),
+                use_container_width=True,
+                hide_index=True,
+                height=520,
+                column_config={
+                    "spec_system": "Spec",
+                    "item_code": st.column_config.LinkColumn("Item Code", display_text=_ITEM_LINK_DISPLAY_RE),
+                    "description": "Description",
+                    "unit": "Unit",
+                    "bidder_name": "Bidder",
+                    "quantity": st.column_config.NumberColumn("Quantity", format="%,.2f"),
+                    "unit_price": st.column_config.NumberColumn("Unit Price", format="$%,.2f"),
+                    "extended_total": st.column_config.NumberColumn("Extended Total", format="$%,.2f"),
+                    "bid_rank": st.column_config.NumberColumn("Rank", format="%d"),
+                    "is_winner": st.column_config.CheckboxColumn("Winner"),
+                },
+            )
+            st.download_button(
+                "Export Schedule CSV",
+                data=lines_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"project_{proj.get('agency_project_num', project_id)}_schedule.csv",
+                mime="text/csv",
+            )
 
 
 def _render_contractor_detail_page(contractor_name: str) -> None:
@@ -361,15 +517,20 @@ def _render_contractor_detail_page(contractor_name: str) -> None:
         ["🏆 Bids Won", "📄 All Itemized Bids", "🏛️ Agencies Breakdown", "🧱 Top Pay Items Bid"]
     )
 
+    ptbl_ver = st.session_state.get("project_table_ver", 0)
     won_df = details["won_projects_df"]
     with tab_won:
         if won_df.empty:
             st.info("No awarded projects recorded for this contractor yet.")
         else:
-            st.dataframe(
+            st.caption("Click any row below to inspect full project details, bidder rankings, and saved PDFs.")
+            won_evt = st.dataframe(
                 won_df.drop(columns=["project_id"]),
                 use_container_width=True,
                 hide_index=True,
+                key=f"c_won_tbl_{ptbl_ver}",
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
                     "agency": "Agency",
                     "agency_project_num": "Project #",
@@ -382,6 +543,10 @@ def _render_contractor_detail_page(contractor_name: str) -> None:
                     "source_url": st.column_config.LinkColumn("Source", display_text="Open"),
                 },
             )
+            won_sel = getattr(getattr(won_evt, "selection", None), "rows", None) or []
+            if won_sel:
+                st.session_state["selected_project_id"] = int(won_df.iloc[int(won_sel[0])]["project_id"])
+                st.rerun()
             st.download_button(
                 "Export Won Projects CSV",
                 data=won_df.to_csv(index=False).encode("utf-8"),
@@ -396,10 +561,14 @@ def _render_contractor_detail_page(contractor_name: str) -> None:
         else:
             show_bids = bids_df.copy()
             show_bids["is_winner"] = show_bids["is_winner"].fillna(0).astype(bool)
-            st.dataframe(
+            st.caption("Click any row below to inspect full bid details and saved PDFs.")
+            bids_evt = st.dataframe(
                 show_bids.drop(columns=["project_id"]),
                 use_container_width=True,
                 hide_index=True,
+                key=f"c_bids_tbl_{ptbl_ver}",
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
                     "agency": "Agency",
                     "agency_project_num": "Project #",
@@ -415,6 +584,10 @@ def _render_contractor_detail_page(contractor_name: str) -> None:
                     "source_url": st.column_config.LinkColumn("Source", display_text="Open"),
                 },
             )
+            bids_sel = getattr(getattr(bids_evt, "selection", None), "rows", None) or []
+            if bids_sel:
+                st.session_state["selected_project_id"] = int(bids_df.iloc[int(bids_sel[0])]["project_id"])
+                st.rerun()
             st.download_button(
                 "Export All Bids CSV",
                 data=bids_df.to_csv(index=False).encode("utf-8"),
@@ -545,11 +718,16 @@ def _render_overview_detail_page(detail_key: str, stats: dict) -> None:
         if df.empty:
             st.info("No matching projects found.")
         else:
-            st.dataframe(
+            st.caption("Click any row below to inspect full project details, bidder rankings, itemized schedule, and saved PDFs.")
+            ptbl_ver = st.session_state.get("project_table_ver", 0)
+            proj_evt = st.dataframe(
                 df.drop(columns=["project_id"]),
                 use_container_width=True,
                 hide_index=True,
                 height=520,
+                key=f"{detail_key}_projects_tbl_{ptbl_ver}",
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
                     "agency": "Agency",
                     "agency_project_num": "Project #",
@@ -561,9 +739,14 @@ def _render_overview_detail_page(detail_key: str, stats: dict) -> None:
                     "awarded_contractor": "Awarded Contractor",
                     "contractor_employees": st.column_config.NumberColumn("Approx. Employees", format="%,d"),
                     "bid_line_count": st.column_config.NumberColumn("Bid Lines", format="%d"),
-                    "source_url": st.column_config.LinkColumn("Source", display_text="Open"),
+                    "doc_count": st.column_config.NumberColumn("Saved Docs", format="%d"),
+                    "source_url": st.column_config.LinkColumn("Source / PDF", display_text="Open"),
                 },
             )
+            proj_sel = getattr(getattr(proj_evt, "selection", None), "rows", None) or []
+            if proj_sel:
+                st.session_state["selected_project_id"] = int(df.iloc[int(proj_sel[0])]["project_id"])
+                st.rerun()
             st.download_button(
                 "Download Projects CSV",
                 data=df.to_csv(index=False).encode("utf-8"),
@@ -863,6 +1046,7 @@ def _render_item_detail_page(item_code: str, initial_spec: str = "ALL") -> None:
 qp_item = unquote(str(st.query_params.get("item", "") or "").strip())
 qp_spec = str(st.query_params.get("spec", "ALL") or "ALL").strip().upper()
 qp_contractor = unquote(str(st.query_params.get("contractor", "") or "").strip())
+qp_project = str(st.query_params.get("project", "") or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -906,8 +1090,11 @@ with st.sidebar:
 # Dedicated Pay Item Detail or Contractor Profile View
 # ---------------------------------------------------------------------------
 active_contractor = st.session_state.get("selected_contractor") or qp_contractor
+active_project_id = st.session_state.get("selected_project_id") or (int(qp_project) if qp_project.isdigit() else None)
 if qp_item:
     _render_item_detail_page(qp_item, qp_spec)
+elif active_project_id:
+    _render_project_detail_page(int(active_project_id))
 elif active_contractor:
     _render_contractor_detail_page(active_contractor)
 

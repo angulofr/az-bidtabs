@@ -20,13 +20,18 @@ from src.db import (
     upsert_contractor,
     upsert_pay_item,
     upsert_project,
+    upsert_project_document,
 )
 from src.normalize import normalize_item_code, normalize_unit
+from src.pdf_archive import save_pdf_artifact
 
 ADOT_E2C2_URL = "https://apps.azdot.gov/e2c2/HistoricalPrice.aspx"
 ADOT_BID_TABS_URL = "https://azdot.gov/business/contracts-and-specifications/bid-tabulations"
 ADOT_CNSADS_TABULATIONS_URL = "https://cnsads.azdot.gov/tabulations"
-TRACS_RE = re.compile(r"(?<![A-Z0-9])([FHT]\d{3,5}[0-9A-Z]{2,4})(?![A-Z0-9])", re.IGNORECASE)
+TRACS_RE = re.compile(
+    r"(?<![A-Z0-9])((?:[FHT]|S[LSZ])\d{3,5}[0-9A-Z]{2,4})(?![A-Z0-9])",
+    re.IGNORECASE,
+)
 
 _MONEY_RE = re.compile(r"^\$?\s*([\d,]+\.\d{2,4})$")
 _ITEM_LINE_RE = re.compile(
@@ -475,6 +480,9 @@ def scrape_adot_e2c2_historical(
 def ingest_parsed_project(
     parsed: ParsedProjectBidTab,
     db_path: Path | str | None = None,
+    *,
+    doc_meta: dict[str, Any] | None = None,
+    doc_type: str = "bid_tab_pdf",
 ) -> int:
     """Persist a ParsedProjectBidTab into SQLite or Postgres (idempotent on re-upload)."""
     with db_session(db_path) as conn:
@@ -498,6 +506,23 @@ def ingest_parsed_project(
             awarded_contractor_id=awarded_cid,
             source_url=parsed.source_url,
         )
+        if parsed.source_url or doc_meta:
+            meta = doc_meta or {}
+            src = str(meta.get("source_url") or parsed.source_url or "")
+            if src:
+                upsert_project_document(
+                    conn,
+                    project_id=project_id,
+                    doc_type=doc_type,
+                    title=parsed.title or f"{parsed.agency} {parsed.agency_project_num}",
+                    source_url=src,
+                    archive_url=meta.get("archive_url"),
+                    local_path=meta.get("local_path"),
+                    bucket=meta.get("bucket"),
+                    asset_name=meta.get("asset_name"),
+                    sha256=meta.get("sha256"),
+                    file_size=meta.get("file_size"),
+                )
 
         # Idempotent re-import: clear prior lines for this project
         conn.execute("DELETE FROM bid_lines WHERE project_id = ?", (project_id,))
@@ -653,16 +678,63 @@ def run_adot_archive_sync(
     skipped = 0
     errors: list[str] = []
 
+    with db_session(db_path) as conn:
+        docs_saved = {
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT DISTINCT p.agency_project_num
+                FROM projects p
+                JOIN project_documents pd ON p.project_id = pd.project_id
+                WHERE p.agency = 'ADOT' AND pd.sha256 IS NOT NULL
+                """
+            ).fetchall()
+            if r[0]
+        }
+
     for item in links:
-        if item["project_num"] in existing_nums:
+        already_itemized = item["project_num"] in existing_nums
+        if already_itemized and item["project_num"] in docs_saved:
             skipped += 1
             continue
         if dry_run:
-            ingested += 1
+            if not already_itemized:
+                ingested += 1
+            else:
+                skipped += 1
             continue
         try:
             pdf_resp = sess.get(item["url"], timeout=timeout)
             pdf_resp.raise_for_status()
+            doc_meta = save_pdf_artifact(
+                pdf_resp.content,
+                bucket="adot",
+                filename_hint=item["url"].split("/")[-1] or item["project_num"],
+                source_url=item["url"],
+            )
+            if already_itemized:
+                if doc_meta:
+                    with db_session(db_path) as conn:
+                        row = conn.execute(
+                            "SELECT project_id, title FROM projects WHERE agency = 'ADOT' AND agency_project_num = ?",
+                            (item["project_num"],),
+                        ).fetchone()
+                        if row:
+                            upsert_project_document(
+                                conn,
+                                project_id=int(row[0]),
+                                doc_type="bid_tab_pdf",
+                                title=str(row[1] or item["title"]),
+                                source_url=item["url"],
+                                archive_url=doc_meta.get("archive_url"),
+                                local_path=doc_meta.get("local_path"),
+                                bucket=doc_meta.get("bucket"),
+                                asset_name=doc_meta.get("asset_name"),
+                                sha256=doc_meta.get("sha256"),
+                                file_size=doc_meta.get("file_size"),
+                            )
+                skipped += 1
+                continue
             parsed = parse_adot_bid_tab_pdf(pdf_resp.content)
             if parsed.agency_project_num == "ADOT-UNKNOWN" or (
                 TRACS_RE.fullmatch(item["project_num"])
@@ -673,8 +745,9 @@ def run_adot_archive_sync(
                 parsed.title = item["title"]
             parsed.source_url = item["url"]
             if parsed.lines:
-                ingest_parsed_project(parsed, db_path)
+                ingest_parsed_project(parsed, db_path, doc_meta=doc_meta, doc_type="bid_tab_pdf")
                 existing_nums.add(parsed.agency_project_num)
+                docs_saved.add(parsed.agency_project_num)
                 ingested += 1
             else:
                 skipped += 1

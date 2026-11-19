@@ -17,6 +17,7 @@ from src.db import (
     upsert_contractor,
     upsert_project,
     upsert_project_bid,
+    upsert_project_document,
 )
 from src.scrapers.adot import ParsedBidLine, ParsedProjectBidTab, ingest_parsed_project
 from src.scrapers.bonfire import is_civil_project
@@ -34,11 +35,13 @@ DEFAULT_CIVIL_QUERY = (
 )
 
 _MARICOPA_CIVIL_ABBREV_RE = re.compile(
-    r"\b(RD|HWY|AVE|BLVD|PKWY|FCD|MCDOT|GUARDRAIL|CHANNEL|CULVERT|SIGNING|"
-    r"SIGNAL|STRIPING|OVERLAY|MILLING|DETENTION|RETENTION|LEVEE|CANAL|"
+    r"\b(RD|HWY|AVE|BLVD|PKWY|FCD|MCDOT|GUARD\s*RAIL|CHANNEL|CULVERT|SIGNING|SIGNAGE|"
+    r"SIGNAL|STRIPI?NG|OVERLAY|MILLING|DETENTION|RETENTION|LEVEE|CANAL|RIPRAP|"
     r"ROUNDABOUT|DRAINAGE|EXCAVATION|GRADING|PAVING|RESURFACING|INTERSECTION|"
-    r"FLOOD|STORMWATER|SEWER|WATERLINE|SIDEWALK|CURB|BRIDGE|ROADWAY|STREET)\b"
-    r"|CHIP\s+SEAL|\bTT\d{3,5}\b|\bJOC\b",
+    r"FLOOD|STORMWATER|SEWER|WATERLINE|SIDEWALK|CURB|BRIDGE|ROADWAY|ROAD|STREET|"
+    r"CONCRETE|ASPHALT|PAVEMENT|AGGREGATE|GRAVEL|PARKING\s+LOT|DRY\s*WELL|"
+    r"CIVIL\s+ENGINEERING|LAND\s+SURVEY\w*|DUST\s+CONTROL|STABILIZATION|ITS)\b"
+    r"|(?:CRACK|SLURRY|CHIP)\s+SEAL|\bTT\d{3,5}\b|\bJOC\b|\bMC\d{3,5}\b",
     re.IGNORECASE,
 )
 _MARICOPA_NON_CIVIL_EXCLUSIONS = (
@@ -231,7 +234,7 @@ def fetch_bidsync_listings(
     # and stop only when 0 rows return.
     vs_input = soup.find("input", {"name": "javax.faces.ViewState"})
     vs_val = str(vs_input.get("value") or "") if vs_input else ""
-    first_offset = 10
+    first_offset = 0 if not query else 10
 
     for _ in range(max_ajax_pages):
         if len(listings) >= limit or not vs_val:
@@ -356,7 +359,7 @@ def parse_bidsync_tab_with_totals(
             )
             if current_lines:
                 supplier_blocks.append((current_supplier, current_awarded, total, current_lines))
-            if total > 0:
+            if total > 0 or current_awarded:
                 raw_totals.append((current_supplier, current_awarded, total))
         current_supplier = ""
         current_awarded = False
@@ -480,10 +483,19 @@ def _ingest_bidsync_totals_only(
             title=parsed.title,
             county=parsed.county,
             letting_date=parsed.letting_date or None,
-            winning_bid_total=parsed.winning_bid_total,
+            winning_bid_total=parsed.winning_bid_total if parsed.winning_bid_total else None,
             awarded_contractor_id=winner_cid,
             source_url=parsed.source_url,
         )
+        if parsed.source_url:
+            upsert_project_document(
+                conn,
+                project_id=pid,
+                doc_type="bidsync_tab",
+                title=f"Maricopa BidSync Bid Tabulation ({parsed.agency_project_num})",
+                source_url=parsed.source_url,
+            )
+        recorded = 0
         for rank, (supplier, total, is_winner) in enumerate(bidder_totals, start=1):
             cid = upsert_contractor(conn, supplier)
             upsert_project_bid(
@@ -495,7 +507,8 @@ def _ingest_bidsync_totals_only(
                 bid_rank=rank,
                 is_winner=is_winner,
             )
-    return len(bidder_totals)
+            recorded += 1
+    return recorded
 
 
 def run_maricopa_bidsync_sync(
@@ -554,7 +567,7 @@ def run_maricopa_bidsync_sync(
             )
             if parsed.lines:
                 if not dry_run:
-                    ingest_parsed_project(parsed, db_path)
+                    ingest_parsed_project(parsed, db_path, doc_type="bidsync_tab")
                 existing_nums.add(parsed.agency_project_num)
                 ingested += 1
                 total_lines += len(parsed.lines)

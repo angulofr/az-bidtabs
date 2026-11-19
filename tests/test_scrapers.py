@@ -1040,7 +1040,7 @@ def test_bidsync_step50_and_lump_sum_plus_maricopa_onbase(tmp_path: Path):
     bs_sess.post.side_effect = _bidsync_post
     listings = fetch_bidsync_listings(limit=100, query="", max_ajax_pages=5, session=bs_sess)
     assert len(listings) == 46
-    assert posted_first_offsets == ["10", "60"]
+    assert posted_first_offsets == ["0", "50"]
 
     # 2. Verify lump-sum BidSync page (no unit-price rows) saves totals into project_bids
     lump_sum_html = """
@@ -1149,6 +1149,171 @@ def test_bidsync_step50_and_lump_sum_plus_maricopa_onbase(tmp_path: Path):
             "SELECT agency_project_num, winning_bid_total FROM projects ORDER BY agency_project_num"
         ).fetchall()
     assert [tuple(r) for r in rows] == [("240001-JOC", 425000.0), ("250045", 1250000.0)]
+
+
+def test_gap_fixes_stb_layouts_wayback_cdx_bidsync_zero_expiration_chandler_bidnet(tmp_path: Path):
+    from unittest.mock import MagicMock, patch
+
+    from src.db import db_session, init_db
+    from src.scrapers.adot_archive import (
+        WAYBACK_CDX_URL,
+        _extract_stb_meeting_date,
+        discover_wayback_s3_cdx_pdfs,
+        parse_stb_awards_pdf,
+    )
+    from src.scrapers.bidnet_az import (
+        BIDNET_AZ_PORTALS,
+        fetch_bidnet_portal,
+        run_bidnet_portal_sync,
+    )
+    from src.scrapers.maricopa_bidsync import (
+        is_maricopa_civil_project,
+        parse_bidsync_tab_with_totals,
+    )
+    from src.scrapers.maricopa_onbase import (
+        MARICOPA_EXPIRATION_PDF_URL,
+        fetch_expiration_report_contracts,
+    )
+    from src.scrapers.mesa_chandler import (
+        APP_AZ_BROWSE_URL,
+        fetch_chandler_solicitations,
+    )
+
+    # 1. STB multi-column 6-col table + plain-text 2010 Office Memo + date parsing
+    assert _extract_stb_meeting_date("https://example.com/2018-051818_Awards.pdf") == "2018-05-18"
+    assert _extract_stb_meeting_date("https://example.com/220520-awards.pdf") == "2022-05-20"
+    assert _extract_stb_meeting_date("https://example.com/Awards-021624.pdf") == "2024-02-16"
+
+    page_multicol = MagicMock()
+    page_multicol.extract_tables.return_value = [
+        [
+            ["DESCRIPTION OF WORK", "", "", "TRACS #\nPROJECT #", "LOW BIDDER", "BOARD ACTION"],
+            ["", "I-8 widening", "", "008 MA 096 H892201C\nNHPP-008-A(227)T", "FNF CONSTRUCTION, INC.", "AWARD\n$ 8,581,891.12"],
+            ["", "continuation desc", "", "", "", ""],
+        ]
+    ]
+    page_memo = MagicMock()
+    page_memo.extract_tables.return_value = []
+    page_memo.extract_text.return_value = (
+        "ARIZONA DEPARTMENT OF TRANSPORTATION\n"
+        "OFFICE MEMO\n"
+        "017 CN 340 H768201C Combs Construction Company $ 148,057.95 AWARD\n"
+        "IM-017-B(205)A Inc\n"
+        "0000 MA CVK SS85601C Southwest Slurry Seal $ 409,507.85 AWARD\n"
+    )
+    mock_pdf_stb = MagicMock()
+    mock_pdf_stb.pages = [page_multicol, page_memo]
+    mock_pdf_stb.__enter__ = MagicMock(return_value=mock_pdf_stb)
+    mock_pdf_stb.__exit__ = MagicMock(return_value=False)
+    with patch("src.scrapers.adot_archive.pdfplumber.open", return_value=mock_pdf_stb):
+        recs = parse_stb_awards_pdf(b"%PDF-mock", source_url="https://example.com/2018-051818_Awards.pdf")
+    assert [r.tracs_num for r in recs] == ["H892201C", "H768201C", "SS85601C"]
+    assert recs[1].low_bidder == "Combs Construction Company Inc"
+    assert recs[2].award_amount == 409507.85
+
+    # 2. Direct Wayback S3 CDX (live S3 + legacy adot-cmss3bp00001 via Wayback)
+    def _cdx_get(url, params=None, **kw):
+        assert WAYBACK_CDX_URL in url
+        pat = (params or {}).get("url", "")
+        if "adot-cmss3bp00001" in pat:
+            return MagicMock(
+                ok=True,
+                json=lambda: [
+                    ["timestamp", "original", "statuscode"],
+                    ["20210401120000", "https://s3-us-west-2.amazonaws.com/adot-cmss3bp00001/F011101C.pdf", "200"],
+                ],
+            )
+        return MagicMock(
+            ok=True,
+            json=lambda: [
+                ["timestamp", "original", "statuscode"],
+                ["20230601120000", "https://s3-us-west-2.amazonaws.com/azdotproductiondefault-adotcloud-prod-s3-files/document/F022201C.pdf", "200"],
+            ],
+        )
+
+    cdx_sess = MagicMock()
+    cdx_sess.headers = {}
+    cdx_sess.get.side_effect = _cdx_get
+    s3_items = discover_wayback_s3_cdx_pdfs(session=cdx_sess, include_legacy_wayback=True)
+    assert len(s3_items) == 2
+    assert s3_items[0]["project_num"] == "F022201C"
+    assert s3_items[1]["pdf_url"].startswith("https://web.archive.org/web/20210401120000id_/")
+
+    # 3. BidSync $0.00 qualification award + expanded civil terms ("GUARD RAIL", "Dry Well")
+    assert is_maricopa_civil_project("GUARD RAIL INSTALLATION, SERVICES & ACCESSORIES RFB")
+    assert is_maricopa_civil_project("Dry Well installation")
+    assert is_maricopa_civil_project("NE Regional Court Parking Lot Replacement")
+    zero_award_html = """
+    <html><body><table>
+      <tr><td><img alt="Awarded" /></td><td><img alt="Click to open supplier bid information" /></td><td>DIBBLE ENGINEERING</td></tr>
+      <tr><td>TOTAL PRICE:</td><td>$0.00</td></tr>
+    </table></body></html>
+    """
+    p_zero, tot_zero = parse_bidsync_tab_with_totals(zero_award_html, project_num="2017-030", title="Construction Admin TT0497")
+    assert p_zero.awarded_contractor == "DIBBLE ENGINEERING"
+    assert tot_zero == [("DIBBLE ENGINEERING", 0.0, True)]
+
+    # 4. Maricopa Expiration-Report-PDF MA5,D730, format
+    exp_page = MagicMock()
+    exp_page.extract_words.return_value = []
+    exp_page.extract_text.return_value = (
+        "MA5,D730,260011 Tonto Hills Water Line Improvements TT0752 LOENBRO, LLC 11/11/2026 8 Paul Shamrock\n"
+        "MA,D730,230021 COUNTY UNIFORMS (2021063) ACE UNIFORMS OF PHOENIX 11/15/2026 12 Anna Le\n"
+    )
+    exp_pdf = MagicMock()
+    exp_pdf.pages = [exp_page]
+    exp_pdf.__enter__ = MagicMock(return_value=exp_pdf)
+    exp_pdf.__exit__ = MagicMock(return_value=False)
+    exp_sess = MagicMock()
+    exp_sess.headers = {}
+    exp_sess.get.return_value = MagicMock(ok=True, content=b"%PDF-1.4\nmock")
+    with patch("src.scrapers.maricopa_onbase.pdfplumber.open", return_value=exp_pdf):
+        exp_map, _ = fetch_expiration_report_contracts(session=exp_sess, archive_pdf=False)
+    assert "260011" in exp_map
+    assert "230021" not in exp_map
+    assert exp_map["260011"][1] == "LOENBRO, LLC"
+    assert exp_map["260011"][2] == "2026-11-11"
+
+    # 5. Chandler APP 2-page pagination
+    ch_rows_p0 = "\n".join(
+        f"<tr><td>{i}</td><td>BPM{i:05d}</td><td>Road Paving {i}</td><td>10/01/2026</td><td>HEAVY CONSTRUCTION</td><td></td><td></td><td>Open</td></tr>"
+        for i in range(15)
+    )
+    ch_rows_p1 = "<tr><td>15</td><td>BPM99999</td><td>Storm Drain Extension</td><td>10/02/2026</td><td>HEAVY CONSTRUCTION</td><td></td><td></td><td>Awarded</td></tr>"
+    ch_init = '<form><input type="hidden" name="__VIEWSTATE" value="v0"/></form>'
+    ch_p0 = f'<form><input type="hidden" name="__VIEWSTATE" value="v1"/></form><table id="body_x_grid_grd">{ch_rows_p0}</table>'
+    ch_p1 = f'<form><input type="hidden" name="__VIEWSTATE" value="v2"/></form><table id="body_x_grid_grd">{ch_rows_p1}</table>'
+    ch_sess = MagicMock()
+    ch_sess.headers = {}
+    ch_sess.get.return_value = MagicMock(ok=True, text=ch_init, raise_for_status=MagicMock())
+    ch_sess.post.side_effect = [
+        MagicMock(ok=True, text=ch_p0, raise_for_status=MagicMock()),
+        MagicMock(ok=True, text=ch_p1, raise_for_status=MagicMock()),
+    ]
+    ch_sols = fetch_chandler_solicitations(limit=30, max_pages=5, session=ch_sess)
+    assert len(ch_sols) == 16
+    assert ch_sols[-1].project_num == "BPM99999"
+
+    # 6. BidNet Direct AZ portal scraper + DB sync
+    bn_html = """
+    <html><body><table><tr><td class="mainCol">
+      <span>260093-S</span> |
+      <a class="solicitation-link" href="/arizona/maricopacounty/solicitations/STREET-SWEEPING-SERVICES/0000441001?purchasingGroupId=700132901">STREET SWEEPING SERVICES</a> |
+      <span>MCDOT</span> | <span>Closed 11/10/2026</span>
+    </td></tr></table></body></html>
+    """
+    bn_sess = MagicMock()
+    bn_sess.headers = {}
+    bn_sess.get.return_value = MagicMock(ok=True, text=bn_html)
+    db_path = tmp_path / "bidnet.db"
+    init_db(db_path)
+    bn_res = run_bidnet_portal_sync("maricopa_county", db_path, limit=10, session=bn_sess)
+    assert bn_res["discovered"] == 1
+    assert bn_res["ingested"] == 1
+    with db_session(db_path) as conn:
+        row = conn.execute("SELECT agency, agency_project_num FROM projects").fetchone()
+    assert tuple(row) == ("MCDOT", "260093-S")
+
 
 
 
